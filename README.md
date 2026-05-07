@@ -1,15 +1,15 @@
 # Soch Automation Diagnostic — Voice AI Widget
 
-A production-ready, embeddable voice widget for [withsoch.com](https://withsoch.com). It conducts a structured 3–4 minute voice discovery call, scores the prospect's automation readiness, identifies their top three opportunities, and ships the lead to n8n.
+Production-ready embeddable voice widget for [withsoch.com](https://withsoch.com). Conducts a structured 3–4 minute voice discovery call, scores the prospect's automation readiness, identifies their top three opportunities, and ships the lead to n8n.
 
-- **Stack**: Node.js + Express backend, vanilla JS embeddable widget
-- **Voice**: Gemini Live API (`gemini-3.1-flash-live-preview`) over a direct browser WebSocket using ephemeral tokens
-- **Lead delivery**: HTTP POST to your n8n webhook
+- **Stack**: Node.js + Express backend, vanilla JS embeddable widget (no framework, no build step)
+- **Voice**: Gemini Live API over a direct browser WebSocket using single-use ephemeral tokens
+- **Lead delivery**: HTTP POST to your n8n webhook, with retry + backoff
 - **Embed**: a single `<script>` tag — works in Webflow with zero configuration
 
 ---
 
-## Quick start (local)
+## Quick start
 
 ```bash
 git clone <this repo>
@@ -19,25 +19,20 @@ npm install
 npm run dev                # http://localhost:3000
 ```
 
-Visit `http://localhost:3000` and the widget will appear in the bottom-right corner. Click it to expand and tap **START** to begin.
+Visit `http://localhost:3000`, click the pill, then **START**.
 
-> Microphone access requires HTTPS in production. `localhost` is exempted by browsers, so dev works without a cert.
+> Microphone access requires HTTPS in production. `localhost` is exempt by browsers, so dev works without a cert.
 
 ### Environment variables
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `GEMINI_API_KEY` | yes | Google AI Studio key. Used server-side only; never sent to the browser. |
-| `N8N_WEBHOOK_URL` | yes (prod) | n8n webhook that receives the final lead JSON. |
-| `PORT` | no | Defaults to `3000`. |
-
----
-
-## Deployment
-
-Deploy `server.js` to any Node host that gives you HTTPS out of the box — Railway, Render, Fly.io, or your own nginx-fronted VM all work. Set the env vars and you're done. The same backend serves both the API endpoints (`/token`, `/lead`) and the static widget files (`/widget.js`, `/widget.css`, `/audio-processor.js`, etc.).
-
-The widget figures out its backend URL from the `<script src>` it was loaded from, so you only have one URL to configure.
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `GEMINI_API_KEY` | yes | — | Google AI Studio key. Used server-side only; never sent to the browser. |
+| `N8N_WEBHOOK_URL` | yes (prod) | — | n8n webhook that receives final leads. |
+| `GEMINI_MODEL` | no | `gemini-3.1-flash-live-preview` | Override the Live model without touching code. |
+| `PORT` | no | `3000` | HTTP port. |
+| `TOKEN_TTL_MS` | no | `1800000` (30 min) | Ephemeral token absolute expiration. |
+| `SESSION_START_TTL_MS` | no | `120000` (2 min) | How long the user has after fetching a token to start the WebSocket session. |
 
 ---
 
@@ -46,47 +41,85 @@ The widget figures out its backend URL from the `<script src>` it was loaded fro
 In Webflow, open **Project Settings → Custom Code → Footer Code** (or drop a Custom Code embed onto a single page) and paste:
 
 ```html
+<script src="https://your-domain.com/widget.js" defer></script>
+```
+
+That's it. The widget self-injects DOM, fonts, and stylesheet. CSS is namespaced under `#soch-voice-widget` so it cannot bleed into your Webflow page. The widget also discovers its backend URL from the `<script src>`, so the same bundle works on any embed origin without configuration.
+
+If you want to avoid a brief flash of unstyled pill on first paint, also include the stylesheet:
+
+```html
 <link rel="stylesheet" href="https://your-domain.com/widget.css">
 <script src="https://your-domain.com/widget.js" defer></script>
 ```
 
-That's it. The widget injects itself into `document.body`, positions itself fixed bottom-right, and self-initializes. No other markup or JS hooks are required. CSS is namespaced under `#soch-voice-widget`, so it cannot bleed into the rest of your Webflow page.
+### Programmatic API
 
-The `<link>` is optional — if you only include the `<script>`, the widget will inject the stylesheet itself. Including it explicitly avoids a brief flash of unstyled content.
+After the script loads, host pages can drive the widget from CTA buttons:
+
+```js
+SochVoiceWidget.open();          // expand the panel
+SochVoiceWidget.close();         // collapse to pill
+SochVoiceWidget.start();         // begin a session
+SochVoiceWidget.end();           // end the active session
+SochVoiceWidget.restart();       // reset and start fresh
+
+SochVoiceWidget.on('lead', (payload) => {
+  // Mirror the lead to your own analytics, chat, etc.
+});
+SochVoiceWidget.on('phase', (i) => console.log('phase', i));
+```
+
+Events: `open`, `close`, `start`, `end`, `restart`, `mute`, `phase`, `score`, `lead`.
 
 ---
 
 ## Architecture
 
 ```
-Browser (widget)
+Browser (widget.js + audio-processor.js)
    │
-   │  GET /token      ─────────►  Express ──► Gemini API (auth tokens)
-   │  ◄────────────  { token }
+   │  GET /token       ─► Express ─► Gemini API (ai.authTokens.create)
+   │  ◄──── { token, model }
    │
-   │  WebSocket  ────────────────────────────►  Gemini Live API
+   │  WebSocket ──────────────────────────► Gemini Live API
    │  PCM16 @16kHz audio in / PCM16 @24kHz audio out
-   │  + tool calls, transcripts
+   │  + tool calls, transcripts, VAD-driven turns
    │
-   │  POST /lead     ──────────►  Express  ──►  n8n webhook
+   │  POST /lead       ─► Express ─► n8n webhook (with retry + backoff)
 ```
 
 ### Files
 
 | File | Role |
 | --- | --- |
-| `server.js` | Express app: serves frontend, mints ephemeral tokens, forwards leads to n8n. |
-| `frontend/widget.js` | Self-injecting widget. State machine, UI, tool handling. |
-| `frontend/gemini-live.js` | WebSocket client for Gemini Live. |
-| `frontend/audio-streamer.js` | Mic capture → PCM16 @ 16kHz → base64. AudioWorklet with ScriptProcessor fallback. |
-| `frontend/audio-processor.js` | AudioWorklet processor (loaded as a separate URL by the browser). |
-| `frontend/audio-player.js` | Queued playback of PCM16 @ 24kHz from Gemini. |
+| `server.js` | Express app: serves frontend, mints ephemeral tokens (locked to model + AUDIO modality), forwards leads to n8n with 3-attempt exponential backoff. Rate-limits `/token` and `/lead`. |
+| `frontend/widget.js` | Single-file bundle: AudioStreamer + AudioPlayer + GeminiLiveClient + UI controller. ~50KB unminified. |
+| `frontend/audio-processor.js` | Standalone AudioWorklet processor (must be served at its own URL). |
 | `frontend/widget.css` | Namespaced styles. |
 | `frontend/index.html` | Local-dev test harness. |
 
+### Wire format
+
+The Gemini Live JSON wire format is **camelCase** end-to-end (snake_case is Python-SDK only). The widget speaks the current spec verbatim:
+
+| Field | Notes |
+| --- | --- |
+| `setup.generationConfig.responseModalities` | `["AUDIO"]` |
+| `setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName` | `Aoede` (configurable in widget.js) |
+| `setup.systemInstruction.parts[].text` | The discovery prompt |
+| `setup.tools[0].functionDeclarations` | All six tool schemas |
+| `setup.inputAudioTranscription` / `outputAudioTranscription` | Both enabled |
+| `realtimeInput.audio` | `{ data: <base64>, mimeType: "audio/pcm;rate=16000" }` — replaces the deprecated `mediaChunks` |
+| `toolResponse.functionResponses[]` | `{ id, name, response: { output } }` |
+| Server: `serverContent.modelTurn.parts[].inlineData` | PCM16 @ 24 kHz audio |
+| Server: `serverContent.{inputTranscription,outputTranscription}` | Streamed deltas with `finished` flag |
+| Server: `toolCall.functionCalls[]` | `{ id, name, args }` |
+| Server: `goAway` | Surfaced to UI; session ends gracefully |
+
 ### Discovery flow & tool calls
 
-The widget exposes six function tools to Gemini. Their order drives the on-screen progress dots:
+The widget exposes six function tools. The order they fire in drives the on-screen progress dots:
 
 1. `capture_company_info` → advances to **Operations**
 2. `capture_operations_data` → advances to **Tools**
@@ -95,7 +128,7 @@ The widget exposes six function tools to Gemini. Their order drives the on-scree
 5. `capture_lead`
 6. `send_to_crm` → POSTs the lead JSON to `/lead`, which forwards to n8n.
 
-Phases advance based on actual tool calls, not a timer.
+Phases advance on actual tool calls, not a timer.
 
 ### Lead payload (POSTed to n8n)
 
@@ -113,18 +146,33 @@ Phases advance based on actual tool calls, not a timer.
 
 ---
 
+## Performance & robustness notes
+
+- **Single-file bundle** — frontend ships as one JS file (plus the worklet, which has to be a separate URL by spec). One round trip on first paint.
+- **Ephemeral tokens locked down** — server passes `liveConnectConstraints: { model, config: { responseModalities: ['AUDIO'] } }` so even an intercepted token can only start an audio session with the configured model.
+- **Hysteresis on user-speaking detection** — the mic-meter doesn't flap at the threshold; rises at 0.025 RMS, falls at 0.012.
+- **RAF-driven waveform animation** — replaces `setInterval` polling; pauses with the tab and is GPU-friendly.
+- **Gapless playback** — incoming audio chunks are scheduled on the AudioContext clock, so bursty network frames still play back-to-back.
+- **Sample-rate fallback** — Safari sometimes refuses to create a 16 kHz `AudioContext`. The widget falls back to the device rate and resamples in software.
+- **PII redaction in logs** — `/lead` logs `name: "T***"`, `email: "te***@domain"` — full payload only goes to n8n.
+- **Rate limiting** — 30/min/IP on `/token`, 10/min/IP on `/lead`.
+- **n8n retry** — 3 attempts with 250 ms / 500 ms / 1 s backoff on 5xx and 429.
+- **AbortController on every fetch** — no hung UI on slow networks.
+- **Idempotent cleanup** — concurrent `endSession()` and `ws.onclose` are safe.
+
 ## Security notes
 
-- **The Gemini API key never leaves the server.** The browser only ever sees a single-use ephemeral token that expires in 60 seconds.
+- The Gemini API key never leaves the server.
 - A fresh ephemeral token is fetched every time the user taps **START**.
-- CORS is open by design — this is meant to be embedded on `withsoch.com` and tested from local dev. Lock down `cors()` origins if you want to restrict.
+- CORS is open by design (the widget is meant to be embedded on `withsoch.com` and tested from local dev). Lock down `cors()` origins for `/lead` if you want to restrict.
 
 ## Browser support
 
-Chrome, Edge, Safari 14+, Firefox 76+. The widget prefers `AudioWorklet` and falls back to `ScriptProcessorNode` on browsers that don't support it.
+Chrome, Edge, Safari 14+, Firefox 76+. Prefers `AudioWorklet`, falls back to `ScriptProcessorNode` on browsers without it.
 
 ## Troubleshooting
 
-- **"Microphone access is needed..."** — the user denied mic permission. They need to re-enable it in the browser site settings.
-- **Connection closes immediately** — usually a missing/expired token or wrong model string. Check server logs for `/token` errors and verify `GEMINI_API_KEY` is valid.
-- **No audio playing** — Safari and some browsers require a user gesture before `AudioContext` can start. The widget kicks the AudioContext on the START tap, so make sure that's the only entrypoint.
+- **"Microphone access is needed…"** — user denied mic permission. They need to re-enable it in browser site settings.
+- **Connection closes immediately** — usually an expired token or a bad model ID. Check server logs and verify `GEMINI_API_KEY` and `GEMINI_MODEL`.
+- **Server returns 503 / model 404** — the configured model isn't enabled on your project. Set `GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-09-2025` (or another live-capable model) and restart.
+- **No audio playing on Safari** — Safari requires a user gesture before `AudioContext` can start. The widget triggers it on the START tap; make sure that's the only entrypoint.

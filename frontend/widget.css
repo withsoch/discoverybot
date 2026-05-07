@@ -1,6 +1,8 @@
-/* Soch Automation Diagnostic — widget styles
- * All selectors namespaced under #soch-voice-widget so the widget cannot
- * leak styles into the host page (Webflow, withsoch.com, etc.).
+/* Soch Automation Diagnostic — embedded widget styles.
+ *
+ * Every selector is scoped under #soch-voice-widget so styles cannot leak
+ * into the host page (Webflow templates, withsoch.com, etc.). Visibility
+ * uses the standard [hidden] attribute rather than a custom !important class.
  */
 
 #soch-voice-widget,
@@ -8,6 +10,8 @@
   box-sizing: border-box;
   font-family: 'DM Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
+
+#soch-voice-widget [hidden] { display: none; }
 
 #soch-voice-widget {
   position: fixed;
@@ -42,6 +46,9 @@
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.04); }
 }
+@media (prefers-reduced-motion: reduce) {
+  #soch-voice-widget .soch-pill { animation: none; }
+}
 
 /* ---------- Expanded panel ---------- */
 #soch-voice-widget .soch-panel {
@@ -63,8 +70,6 @@
   transform: scale(1);
   opacity: 1;
 }
-
-#soch-voice-widget .soch-hidden { display: none !important; }
 
 /* Header */
 #soch-voice-widget .soch-header {
@@ -147,10 +152,10 @@
   height: 4px;
   background: #444;
   border-radius: 2px;
-  transition: height 0.08s ease, background 0.2s ease;
+  /* No CSS transition — heights are driven by RAF for smooth, GPU-friendly motion. */
 }
 #soch-voice-widget .soch-bars.ai .soch-bar { background: #ea6a47; }
-#soch-voice-widget .soch-bars.user .soch-bar { background: #666; }
+#soch-voice-widget .soch-bars.user .soch-bar { background: #777; }
 #soch-voice-widget .soch-status {
   font-size: 12px;
   color: #aaa;
@@ -289,7 +294,7 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 #soch-voice-widget .soch-iconbtn:hover { background: #333; }
 #soch-voice-widget .soch-iconbtn.muted { color: #ea6a47; }
@@ -309,6 +314,7 @@
   transition: transform 0.15s ease, background 0.2s ease;
 }
 #soch-voice-widget .soch-main-btn:hover { transform: scale(1.05); }
+#soch-voice-widget .soch-main-btn:disabled { opacity: 0.6; cursor: progress; }
 #soch-voice-widget .soch-main-btn.active {
   background: #c54a2a;
   animation: soch-pulse 1.6s ease-in-out infinite;
