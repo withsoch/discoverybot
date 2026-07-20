@@ -3,7 +3,7 @@
 Production-ready embeddable voice widget for [withsoch.com](https://withsoch.com). Conducts a structured 3–4 minute voice discovery call, scores the prospect's automation readiness, identifies their top three opportunities, and ships the lead to n8n.
 
 - **Stack**: Node.js + Express backend, vanilla JS embeddable widget (no framework, no build step)
-- **Voice**: Gemini Live API over a direct browser WebSocket using single-use ephemeral tokens
+- **Voice**: Gemini Live API over a direct browser WebSocket using single-use ephemeral tokens (requires `@google/genai` ≥ 1.20 — ephemeral tokens are unavailable in 0.x)
 - **Lead delivery**: HTTP POST to your n8n webhook, with retry + backoff
 - **Embed**: a single `<script>` tag — works in Webflow with zero configuration
 
