@@ -83,7 +83,10 @@ app.get('/token', tokenLimiter, async (req, res) => {
         expireTime: new Date(now + TOKEN_TTL_MS).toISOString(),
         newSessionExpireTime: new Date(now + SESSION_START_TTL_MS).toISOString(),
         liveConnectConstraints: {
-          model: GEMINI_MODEL,
+          // Must exactly match the model string the client sends in its
+          // `setup` message (frontend/widget.js prefixes with `models/`),
+          // or Gemini closes the socket right after connecting (code 1007).
+          model: GEMINI_MODEL.startsWith('models/') ? GEMINI_MODEL : `models/${GEMINI_MODEL}`,
           config: { responseModalities: ['AUDIO'] },
         },
         httpOptions: { apiVersion: 'v1alpha' },

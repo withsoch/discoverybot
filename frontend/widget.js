@@ -47,7 +47,11 @@
   const OUTPUT_SAMPLE_RATE = 24000;  // Gemini Live output
   const CHUNK_SAMPLES = 1600;        // ~100 ms of audio per send
   const GEMINI_WS_BASE =
-    'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+    // Ephemeral-token connections MUST use the …Constrained variant of the
+    // method (not plain BidiGenerateContent) — the plain method only accepts
+    // a real API key. Also must match the v1alpha version used to mint the
+    // token, or Gemini rejects it right after the socket opens.
+    'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained';
 
   const PHASES = ['Company', 'Operations', 'Tools', 'Pain Points', 'Score'];
   const RING_CIRCUMFERENCE = 2 * Math.PI * 54; // r=54
@@ -498,7 +502,8 @@ RULES:
 
     connect(ephemeralToken) {
       return new Promise((resolve, reject) => {
-        const url = `${GEMINI_WS_BASE}?key=${encodeURIComponent(ephemeralToken)}`;
+        // Ephemeral tokens go in `access_token`, not `key` (which is for raw API keys).
+        const url = `${GEMINI_WS_BASE}?access_token=${encodeURIComponent(ephemeralToken)}`;
         let settled = false;
         let ws;
         try { ws = new WebSocket(url); }
@@ -557,9 +562,10 @@ RULES:
         ws.onclose = (event) => {
           this.connected = false;
           this.cb.onClose(event);
+          console.warn('[soch] ws closed', { code: event.code, reason: event.reason, wasClean: event.wasClean });
           if (!settled) {
             settled = true;
-            reject(new Error(`WebSocket closed before setup (code ${event.code})`));
+            reject(new Error(`WebSocket closed before setup (code ${event.code}${event.reason ? `: ${event.reason}` : ''})`));
           }
         };
       });
@@ -1048,6 +1054,11 @@ RULES:
         });
 
         await this.client.connect(token);
+
+        // The model won't speak first on its own — nudge it with a hidden
+        // "kickoff" turn so it opens with the scripted Phase 1 greeting
+        // instead of sitting silently waiting for the user to talk first.
+        this.client.sendText('(Session started. Begin the discovery call now, exactly as instructed.)');
 
         this.streamer = new AudioStreamer({
           workletUrl: `${BACKEND_URL}/audio-processor.js`,
