@@ -11,7 +11,8 @@ Embeddable voice widget for [withsoch.com](https://withsoch.com). Conducts a str
 
 - ✅ Core flow works and has been manually tested end-to-end: connects, runs the full 6-question discovery script, scores readiness, captures a lead.
 - ✅ Three connection bugs that previously broke every session have been fixed (see [Troubleshooting](#troubleshooting)).
-- ✅ System prompt now includes real facts about Soch (services, process, Riz, location) pulled from withsoch.com, so the bot can answer basic company questions instead of deflecting or inventing answers.
+- ✅ System prompt now includes real facts about Soch (services, process, founders Riz & Umair, location) pulled from withsoch.com, so the bot can answer basic company questions instead of deflecting or inventing answers.
+- ✅ Fixed a broken-transcript bug: `GEMINI_MODEL` was pinned to `gemini-2.5-flash-native-audio-preview-09-2025`, which has a known Google-side bug where it never emits `outputAudioTranscription` — the widget played audio fine but showed no caption bubbles at all. Switched the default to `gemini-3.1-flash-live-preview`, confirmed with a direct API test that transcription now streams correctly.
 - ⚠️ **`N8N_WEBHOOK_URL` is not yet configured** — leads reach `/lead` and get logged server-side, but nothing is forwarded anywhere permanent until a real webhook URL is set.
 - ⚠️ **Not deployed / not embedded on withsoch.com yet** — dev/local testing only. Do not add the embed script to the live site until this is explicitly approved.
 - ⚠️ Data is only saved at the very end of the call (`send_to_crm`, the last tool call) — if a visitor abandons the call early, nothing captured up to that point is persisted anywhere.
