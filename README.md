@@ -1,11 +1,20 @@
 # Soch Automation Diagnostic — Voice AI Widget
 
-Production-ready embeddable voice widget for [withsoch.com](https://withsoch.com). Conducts a structured 3–4 minute voice discovery call, scores the prospect's automation readiness, identifies their top three opportunities, and ships the lead to n8n.
+Embeddable voice widget for [withsoch.com](https://withsoch.com). Conducts a structured 3–4 minute voice discovery call, scores the prospect's automation readiness, identifies their top three opportunities, and ships the lead to n8n.
 
 - **Stack**: Node.js + Express backend, vanilla JS embeddable widget (no framework, no build step)
 - **Voice**: Gemini Live API over a direct browser WebSocket using single-use ephemeral tokens (requires `@google/genai` ≥ 1.20 — ephemeral tokens are unavailable in 0.x)
 - **Lead delivery**: HTTP POST to your n8n webhook, with retry + backoff
 - **Embed**: a single `<script>` tag — works in Webflow with zero configuration
+
+## Status (as of Sept 2026)
+
+- ✅ Core flow works and has been manually tested end-to-end: connects, runs the full 6-question discovery script, scores readiness, captures a lead.
+- ✅ Three connection bugs that previously broke every session have been fixed (see [Troubleshooting](#troubleshooting)).
+- ✅ System prompt now includes real facts about Soch (services, process, Riz, location) pulled from withsoch.com, so the bot can answer basic company questions instead of deflecting or inventing answers.
+- ⚠️ **`N8N_WEBHOOK_URL` is not yet configured** — leads reach `/lead` and get logged server-side, but nothing is forwarded anywhere permanent until a real webhook URL is set.
+- ⚠️ **Not deployed / not embedded on withsoch.com yet** — dev/local testing only. Do not add the embed script to the live site until this is explicitly approved.
+- ⚠️ Data is only saved at the very end of the call (`send_to_crm`, the last tool call) — if a visitor abandons the call early, nothing captured up to that point is persisted anywhere.
 
 ---
 
@@ -111,6 +120,8 @@ The Gemini Live JSON wire format is **camelCase** end-to-end (snake_case is Pyth
 | `setup.tools[0].functionDeclarations` | All six tool schemas |
 | `setup.inputAudioTranscription` / `outputAudioTranscription` | Both enabled |
 | `realtimeInput.audio` | `{ data: <base64>, mimeType: "audio/pcm;rate=16000" }` — replaces the deprecated `mediaChunks` |
+| WS method | `BidiGenerateContentConstrained`, **not** plain `BidiGenerateContent` — the plain method only accepts a raw API key, not an ephemeral token |
+| WS auth param | `access_token=<ephemeral token>`, **not** `key=` (that's for raw API keys) |
 | `toolResponse.functionResponses[]` | `{ id, name, response: { output } }` |
 | Server: `serverContent.modelTurn.parts[].inlineData` | PCM16 @ 24 kHz audio |
 | Server: `serverContent.{inputTranscription,outputTranscription}` | Streamed deltas with `finished` flag |
@@ -129,6 +140,15 @@ The widget exposes six function tools. The order they fire in drives the on-scre
 6. `send_to_crm` → POSTs the lead JSON to `/lead`, which forwards to n8n.
 
 Phases advance on actual tool calls, not a timer.
+
+### System prompt & company knowledge
+
+The full script lives in `SYSTEM_PROMPT` in `frontend/widget.js`. It has two parts:
+
+1. **The discovery script** — the 6-phase flow above, verbatim opener line, tone rules, and how to handle off-topic questions / declined emails.
+2. **An "ABOUT SOCH" block** — real facts pulled from withsoch.com (services, the Audit → Design → Build & deploy process, Riz as the automation lead, Tallinn location, contact email), used *only* when a prospect asks about the company. Pricing is deliberately kept qualitative — the homepage and services page list different numbers for the same tiers — so the bot defers exact quotes to the call with Riz instead of risking a wrong figure. The bot is instructed never to invent anything beyond what's listed here; if asked something not covered (case studies, past clients, team beyond Riz), it says that's what the call is for and redirects back to its questions.
+
+If Soch's public site content changes (new services, pricing, team), update this block to keep the bot's answers accurate.
 
 ### Lead payload (POSTed to n8n)
 
@@ -176,3 +196,6 @@ Chrome, Edge, Safari 14+, Firefox 76+. Prefers `AudioWorklet`, falls back to `Sc
 - **Connection closes immediately** — usually an expired token or a bad model ID. Check server logs and verify `GEMINI_API_KEY` and `GEMINI_MODEL`.
 - **Server returns 503 / model 404** — the configured model isn't enabled on your project. Set `GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-09-2025` (or another live-capable model) and restart.
 - **No audio playing on Safari** — Safari requires a user gesture before `AudioContext` can start. The widget triggers it on the START tap; make sure that's the only entrypoint.
+- **`WebSocket closed before setup (code 1007: API key not valid...)` even with a good key** — this bit us during testing and cost a lot of debugging time, so noting it explicitly: ephemeral-token sessions **must** connect to `BidiGenerateContentConstrained` with the token passed as `access_token=`. Connecting to plain `BidiGenerateContent` (even with a valid token) or passing the token as `key=` gets rejected with this exact misleading "API key not valid" message. Both are already fixed in `widget.js`, but if you see this error again after editing the WS URL, check those two things first.
+- **`liveConnectConstraints.model` mismatch** — the model string the server locks a minted token to (`server.js`) must exactly match what the client sends in its `setup` message (`widget.js`, which prefixes with `models/`). A mismatch closes the socket the same way as the bug above.
+- **Bot connects but says nothing** — the model doesn't speak first on its own. `widget.js` sends a hidden kickoff turn right after `connect()` to trigger its scripted opener; if that call is ever removed, the bot will sit silently waiting for the user to speak first instead.
