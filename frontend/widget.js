@@ -26,6 +26,7 @@
 
   if (window.__sochVoiceWidgetLoaded) return;
   window.__sochVoiceWidgetLoaded = true;
+  console.log('[soch] widget build: rag-v6+booking-v3');
 
   // ─────────────────────────────────────────────────────────────────────
   // Backend URL discovery
@@ -53,162 +54,30 @@
     // token, or Gemini rejects it right after the socket opens.
     'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained';
 
+  // The server's n8n budget is 25 s (LEAD_TIMEOUT_MS); wait a little longer so
+  // the widget always gets the server's real answer rather than timing out first.
+  const LEAD_CLIENT_TIMEOUT_MS = 30000;
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+  // What the bot may say for each /lead status (returned to Gemini with the
+  // tool result). Only `sent` allows the 24-hour promise.
+  const LEAD_GUIDANCE = {
+    sent: "Success. Say you've just emailed them a link to book a free 30-minute call with Riz, and that they'll receive the follow-up within 24 hours. The link is also on their screen. Do not say any time is booked; they pick the time themselves.",
+    sent_no_followup: "The booking-link email was sent, but the follow-up could not be confirmed. Say you've emailed them the link to book a free 30-minute call with Riz and it's also on their screen. Do NOT mention 24 hours or promise a follow-up. Do not say any time is booked.",
+    saved_no_email: "Their details were saved but the email did NOT send. Say you've passed their details to Riz and they can use the booking link on their screen to schedule the 30-minute call. Do NOT say you emailed them and do NOT mention 24 hours.",
+    failed: "Their details could NOT be sent. Say you couldn't send their details through just now, and that they can use the booking link on their screen to schedule the call, or contact info@withsoch.com. Do NOT say you emailed them, that Riz has their details, or that anything is booked. Do NOT mention 24 hours.",
+  };
+  // Matching on-screen note under the Book-a-Call button.
+  const BOOKING_NOTES = {
+    sent: (email) => `Booking link sent to ${email}. You can also book here.`,
+    sent_no_followup: (email) => `Booking link sent to ${email}. You can also book here.`,
+    saved_no_email: () => "We couldn't email you the link. Use this button to book your call.",
+    failed: () => "We couldn't send your details. Book here, or email info@withsoch.com.",
+  };
+
   const PHASES = ['Company', 'Operations', 'Tools', 'Pain Points', 'Score'];
   const RING_CIRCUMFERENCE = 2 * Math.PI * 54; // r=54
-
-  const SYSTEM_PROMPT = `You are Soch's Automation Consultant — a sharp, friendly voice AI that conducts automated discovery calls for Soch (withsoch.com), a workflow automation agency. Your job is to run a structured 3-4 minute discovery conversation, assess the prospect's automation readiness, and warm them up for a strategy call.
-
-ABOUT SOCH (only use this if the prospect directly asks about the company — never volunteer it, and never invent facts beyond what's here):
-- Soch is an AI automation partner for early-stage to Series A businesses — SaaS, retail, professional services, manufacturing, distribution, and B2B services. Tagline: "More Growth, Less Chaos."
-- Services: AI Agent Development, Operations & Process Automation, Customer Support Automation, Marketing Automation, and RevOps Automation.
-- Process: a 3-step "Audit → Design → Build & deploy" framework.
-- Soch was co-founded by Rizwan Mahmood ("Riz") and Umair Shahzad.
-- Riz leads automation strategy at Soch — he's who prospects get booked with for the follow-up call.
-- Based in Tallinn, Estonia. Contact: info@withsoch.com.
-- If asked about pricing: give the general shape only — engagements range from a focused automation audit up through multi-week build and full "Automation OS" engagements — and say Riz will go over exact pricing for their specific needs on the call. Never quote a specific dollar figure.
-- If asked something about Soch not covered here (case studies, specific past clients, etc.): don't guess — say that's exactly what the call with Riz is for, and redirect back to the discovery questions.
-
-PERSONALITY:
-- Sound like a smart, experienced consultant — not a chatbot
-- Conversational, warm, direct
-- Ask ONE question at a time
-- Never list multiple questions at once
-- Acknowledge what they say before moving on ("Got it", "That makes sense", "Interesting")
-- Keep your turns short — 1-3 sentences max
-- Do not mention scores, functions, or tools — these are invisible to the user
-
-DISCOVERY FLOW (follow this sequence strictly):
-
-PHASE 1 — OPENER
-Start with: "Hey there! I'm Soch's automation consultant. I'll ask you six quick questions about how your team works — takes about three minutes — and at the end I'll tell you exactly which processes you could automate and what that would save you. What does your company do, and roughly how many people are on your team?"
-→ When answered: call capture_company_info() then continue to Phase 2.
-
-PHASE 2 — OPERATIONS
-Ask: "Walk me through a typical week for your ops team — what are the main tasks they handle regularly?"
-→ Follow up: "Which of those happens most often?"
-→ When answered: continue to Phase 3.
-
-PHASE 3 — TOOLS
-Ask: "What tools does your team use day-to-day — things like your CRM, project management, email, spreadsheets?"
-→ When answered: call capture_operations_data() then continue to Phase 4.
-
-PHASE 4 — PAIN POINTS
-Ask: "Where does work tend to slow down or fall through the cracks?"
-→ Follow up: "If you could make one thing in your operations just happen automatically, what would it be?"
-→ When answered: call capture_pain_points() then immediately call calculate_score() and move to Phase 5.
-
-PHASE 5 — SCORE DELIVERY
-Deliver the score verbally, naturally. Example: "Based on everything you've shared, your team scores [SCORE] out of 10 on automation readiness — that puts you in [TIER]. The three areas I'd prioritize for you are: [OPPORTUNITY_1], [OPPORTUNITY_2], and [OPPORTUNITY_3]. I'd love to get you on a 30-minute call with Riz, Soch's head of automation, where he can map these out in detail — completely free. What's your name and email so I can send you the booking link?"
-→ When they share name + email: call capture_lead() then call send_to_crm()
-→ Close: "Perfect. You'll get an email from Riz within 24 hours. Genuinely good chatting with you."
-
-RULES:
-- Never say "as an AI" or reference being a language model
-- If they ask about Soch itself (what it does, pricing, founders, location, etc.) and it's covered in the ABOUT SOCH section above, answer it briefly and directly — that is NOT off-topic, it's a fair question about who they're talking to. Then return to the current phase's question.
-- If they go off topic on something unrelated to Soch or the discovery questions (weather, other companies, personal chat, etc.), gently redirect: "That's worth exploring on the call — for now, let me ask you..."
-- If they decline to give email: "Totally fine — you can also find us at withsoch.com. Good luck with everything."
-- Never rush. Let them finish speaking before responding.`;
-
-  // Wire-format note: the JS/REST surface of the Live API uses camelCase.
-  // (`functionDeclarations`, not `function_declarations`.)
-  const TOOL_DEFINITIONS = [
-    {
-      name: 'capture_company_info',
-      description:
-        'Called after learning the company name, size, and industry. Records basic company context.',
-      parameters: {
-        type: 'object',
-        properties: {
-          company_name: { type: 'string', description: 'Name of the company if mentioned' },
-          team_size: { type: 'string', description: "Number of people on the team (e.g. '12', '50-100')" },
-          industry: { type: 'string', description: 'What the company does / industry' },
-        },
-        required: ['team_size', 'industry'],
-      },
-    },
-    {
-      name: 'capture_operations_data',
-      description:
-        "Called after learning about the company's main processes and tools. Records operational context.",
-      parameters: {
-        type: 'object',
-        properties: {
-          main_processes: { type: 'string', description: 'Comma-separated list of main recurring tasks/processes' },
-          highest_frequency_task: { type: 'string', description: 'The task that happens most often' },
-          tools_used: { type: 'string', description: 'Comma-separated list of tools (CRM, PM, etc.)' },
-          tool_count: { type: 'number', description: 'Approximate number of distinct tools mentioned' },
-        },
-        required: ['main_processes', 'tools_used'],
-      },
-    },
-    {
-      name: 'capture_pain_points',
-      description: 'Called after learning about bottlenecks and automation desires.',
-      parameters: {
-        type: 'object',
-        properties: {
-          main_bottleneck: { type: 'string', description: 'Where work slows down or breaks' },
-          automation_dream: { type: 'string', description: 'The one thing they wish happened automatically' },
-          pain_specificity: {
-            type: 'string',
-            enum: ['vague', 'moderate', 'specific'],
-            description: 'How clearly they can articulate the pain',
-          },
-        },
-        required: ['main_bottleneck', 'pain_specificity'],
-      },
-    },
-    {
-      name: 'calculate_score',
-      description:
-        'Called after all discovery phases are complete. Computes the Automation Readiness Score and identifies top 3 opportunities. Returns score data to display in the UI.',
-      parameters: {
-        type: 'object',
-        properties: {
-          score_out_of_10: {
-            type: 'number',
-            description:
-              'Automation readiness score from 1-10 based on team size fit, process volume, tool fragmentation, pain specificity',
-          },
-          tier: {
-            type: 'string',
-            enum: ['HIGH READINESS', 'MEDIUM READINESS', 'EARLY STAGE'],
-          },
-          opportunity_1: {
-            type: 'string',
-            description: "Top automation opportunity — be specific e.g. 'Lead follow-up sequences from CRM'",
-          },
-          opportunity_2: { type: 'string', description: 'Second automation opportunity' },
-          opportunity_3: { type: 'string', description: 'Third automation opportunity' },
-          score_rationale: { type: 'string', description: '1 sentence explaining why this score' },
-        },
-        required: ['score_out_of_10', 'tier', 'opportunity_1', 'opportunity_2', 'opportunity_3'],
-      },
-    },
-    {
-      name: 'capture_lead',
-      description: 'Called when the prospect shares their name and email.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string' },
-          email: { type: 'string' },
-        },
-        required: ['name', 'email'],
-      },
-    },
-    {
-      name: 'send_to_crm',
-      description: "Called after lead is captured. Sends full lead profile to Soch's CRM via backend.",
-      parameters: {
-        type: 'object',
-        properties: {
-          confirmed: { type: 'boolean', description: 'Always true — confirms all data is ready to send' },
-        },
-        required: ['confirmed'],
-      },
-    },
-  ];
+  const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/u;
 
   // ─────────────────────────────────────────────────────────────────────
   // Audio helpers
@@ -232,6 +101,43 @@ RULES:
       binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
     }
     return btoa(binary);
+  }
+
+  /** Marks tool-result guidance so the model follows it rather than speaking it. */
+  function internalNote(text) {
+    return `INTERNAL NOTE (follow it, never read it aloud): ${text}`;
+  }
+
+  /**
+   * True when every letter of the name also spells the email's local part
+   * (e.g. "Max Ok" from max.ok@example.com) — a sign it was read off the
+   * address rather than said by the prospect.
+   */
+  function nameLooksDerivedFromEmail(name, email) {
+    const letters = (s) => s.toLowerCase().replace(/[^a-z]/g, '');
+    const local = letters(String(email).split('@')[0] || '');
+    const n = letters(name);
+    return n.length > 0 && n === local;
+  }
+
+  /**
+   * True if spoken text reads back this email ("olga dot ok at example dot com").
+   * Speech transcripts vary ("ok" → "okay"), so it checks for the domain and the
+   * start of the local part rather than an exact match.
+   */
+  function textReadsBackEmail(text, email) {
+    const alnum = (v) => String(v).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const spoken = alnum(String(text).toLowerCase().replace(/\b(dot|at)\b/g, ''));
+    const [local, domain] = String(email).split('@');
+    const head = alnum(local).slice(0, 3);
+    return head.length > 0 && spoken.includes(head) && spoken.includes(alnum(domain || ''));
+  }
+
+  function newSessionId() {
+    const raw = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    return 'sv_' + raw.replace(/[^A-Za-z0-9]/g, '');
   }
 
   /** Decode base64 PCM16 (little-endian) into a Float32Array in [-1, 1]. */
@@ -492,15 +398,13 @@ RULES:
   class GeminiLiveClient {
     constructor(opts) {
       this.model = opts.model;
-      this.systemInstruction = opts.systemInstruction || '';
-      this.tools = opts.tools || [];
-      this.voiceName = opts.voiceName || 'Aoede';
       this.cb = {
         onAudio: opts.onAudio || (() => {}),
         onUserTranscript: opts.onUserTranscript || (() => {}),
         onModelTranscript: opts.onModelTranscript || (() => {}),
         onToolCall: opts.onToolCall || (() => {}),
         onTurnComplete: opts.onTurnComplete || (() => {}),
+        onModelTurnEnd: opts.onModelTurnEnd || (() => {}),
         onInterrupted: opts.onInterrupted || (() => {}),
         onOpen: opts.onOpen || (() => {}),
         onClose: opts.onClose || (() => {}),
@@ -523,26 +427,13 @@ RULES:
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {
-          // camelCase wire format per current Gemini Live spec.
+          // Prompt, tools, voice and transcription are locked into the
+          // ephemeral token server-side; only the model is sent here.
           const setup = {
             setup: {
               model: this.model.startsWith('models/')
                 ? this.model
                 : `models/${this.model}`,
-              generationConfig: {
-                responseModalities: ['AUDIO'],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: this.voiceName },
-                  },
-                },
-              },
-              systemInstruction: { parts: [{ text: this.systemInstruction }] },
-              tools: this.tools.length
-                ? [{ functionDeclarations: this.tools }]
-                : undefined,
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
             },
           };
           ws.send(JSON.stringify(setup));
@@ -614,16 +505,24 @@ RULES:
           for (const part of sc.modelTurn.parts) {
             if (part.inlineData && typeof part.inlineData.data === 'string') {
               this.cb.onAudio(part.inlineData.data);
+            } else if (part.thought) {
+              // Native-audio models stream private reasoning as text parts; never show it.
             } else if (part.text) {
               this.cb.onModelTranscript(part.text, false);
             }
           }
         }
         if (sc.turnComplete || sc.generationComplete) this.cb.onTurnComplete();
+        // turnComplete (not generationComplete) marks the model handing the
+        // floor back to the user — used to require a user reply between
+        // capture_lead and send_to_crm.
+        if (sc.turnComplete) this.cb.onModelTurnEnd();
       }
 
       if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
-        for (const call of msg.toolCall.functionCalls) this.cb.onToolCall(call);
+        for (const call of msg.toolCall.functionCalls) {
+          this.cb.onToolCall(call);
+        }
       }
       if (msg.goAway) this.cb.onGoAway(msg.goAway);
     }
@@ -740,6 +639,11 @@ RULES:
 
         <div class="soch-error" hidden></div>
 
+        <div class="soch-booking" hidden>
+          <a class="soch-book-btn" href="#" target="_blank" rel="noopener noreferrer">Book a 30-min call with Riz</a>
+          <p class="soch-booking-note" hidden></p>
+        </div>
+
         <div class="soch-bottom">
           <button class="soch-iconbtn soch-mic" type="button" aria-label="Mute microphone" title="Mute">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -785,6 +689,9 @@ RULES:
         tier: $('.soch-tier'),
         opps: $('.soch-opps'),
         error: $('.soch-error'),
+        booking: $('.soch-booking'),
+        bookBtn: $('.soch-book-btn'),
+        bookingNote: $('.soch-booking-note'),
         mic: $('.soch-mic'),
         mainBtn: $('.soch-main-btn'),
         restart: $('.soch-restart'),
@@ -797,6 +704,18 @@ RULES:
       this.muted = false;
       this.phaseIndex = -1;
       this.leadData = {};
+      // One id per conversation (kept across END/START, reset by restart) so
+      // n8n updates the same lead instead of creating duplicates.
+      this.sessionId = null;
+      this.bookingUrl = null;      // existing Cal.com 30-min event, from /token
+      this.storedLeadSig = null;   // signature of the last payload n8n confirmed stored
+      // Email confirmation guard: send_to_crm is only allowed once the model has
+      // ended at least one turn (read the email back) since capture_lead.
+      this.modelTurns = 0;
+      this.turnText = '';          // what the bot has said in the current turn
+      this.lastTurnText = '';      // …and in the previous one
+      this.captureTurn = null;
+      this.emailConfirmed = false;
       this.client = null;
       this.streamer = null;
       this.player = null;
@@ -840,6 +759,23 @@ RULES:
       this.els.mainBtn.addEventListener('click', () => this.toggleSession());
       this.els.mic.addEventListener('click', () => this.toggleMute());
       this.els.restart.addEventListener('click', () => this.restart());
+      this.els.bookBtn.addEventListener('click', () => this._emit('booking_click', { session_id: this.sessionId }));
+      // Last chance to save a partial lead when the visitor closes the tab.
+      window.addEventListener('pagehide', () => this._savePartialLead({ beacon: true }));
+    }
+
+    /**
+     * Shows the Book-a-Call button whenever the booking URL is known. `link`
+     * is the prefilled per-lead URL once the lead has been submitted; the note
+     * says truthfully what happened to the email.
+     */
+    _renderBooking(link, note) {
+      const href = link || this.bookingUrl;
+      if (!href) { this.els.booking.hidden = true; return; }
+      this.els.bookBtn.href = href;
+      this.els.booking.hidden = false;
+      this.els.bookingNote.textContent = note || '';
+      this.els.bookingNote.hidden = !note;
     }
 
     open() {
@@ -887,16 +823,28 @@ RULES:
 
     appendUserTranscript(text, finished) {
       if (!text) return;
-      if (!this.userBubble) this.userBubble = this.addMessage('user', text);
-      else {
-        this.userBubble.textContent += text;
-        this.els.transcript.scrollTop = this.els.transcript.scrollHeight;
+      // The Live model's speech recognition often writes accented English in
+      // Devanagari/Telugu script and ignores language hints, so hide any
+      // utterance containing non-Latin letters rather than show it garbled.
+      if (!this.userHidden && NON_LATIN_LETTER.test(text)) {
+        this.userHidden = true;
+        if (this.userBubble) { this.userBubble.remove(); this.userBubble = null; }
       }
-      if (finished) this.userBubble = null;
+      if (!this.userHidden) {
+        if (!this.userBubble) this.userBubble = this.addMessage('user', text);
+        else {
+          this.userBubble.textContent += text;
+          this.els.transcript.scrollTop = this.els.transcript.scrollHeight;
+        }
+      }
+      if (finished) { this.userBubble = null; this.userHidden = false; }
     }
 
     appendModelTranscript(text, finished) {
       if (!text) return;
+      // The bot replying means the user's utterance is over.
+      this.userBubble = null;
+      this.userHidden = false;
       if (!this.modelBubble) this.modelBubble = this.addMessage('ai', text);
       else {
         this.modelBubble.textContent += text;
@@ -1010,7 +958,10 @@ RULES:
       this.els.mainBtn.disabled = true;
 
       try {
-        const { token, model } = await this._fetchToken();
+        const { token, model, booking_url } = await this._fetchToken();
+        if (!this.sessionId) this.sessionId = newSessionId();
+        this.bookingUrl = booking_url || null;
+        if (this.els.booking.hidden) this._renderBooking();
 
         this.player = new AudioPlayer({
           onStateChange: (playing) => {
@@ -1028,12 +979,9 @@ RULES:
 
         this.client = new GeminiLiveClient({
           model,
-          systemInstruction: SYSTEM_PROMPT,
-          tools: TOOL_DEFINITIONS,
-          voiceName: 'Aoede',
           onAudio: (b64) => this.player.enqueue(b64).catch(console.error),
           onUserTranscript: (t, fin) => this.appendUserTranscript(t, fin),
-          onModelTranscript: (t, fin) => this.appendModelTranscript(t, fin),
+          onModelTranscript: (t, fin) => { this.turnText += t; this.appendModelTranscript(t, fin); },
           onToolCall: (call) => this._handleToolCall(call),
           onTurnComplete: () => {
             // Don't reset bubbles here — `finished` flag does that. We just
@@ -1043,6 +991,7 @@ RULES:
               this._setBarsMode(this.userSpeaking ? 'user' : 'idle');
             }
           },
+          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; },
           onInterrupted: () => { if (this.player) this.player.interrupt(); },
           onOpen: () => this.setStatus('Listening…'),
           onClose: () => {
@@ -1069,7 +1018,9 @@ RULES:
         // The model won't speak first on its own — nudge it with a hidden
         // "kickoff" turn so it opens with the scripted Phase 1 greeting
         // instead of sitting silently waiting for the user to talk first.
-        this.client.sendText('(Session started. Begin the discovery call now, exactly as instructed.)');
+        // A parenthetical system-style note gets an empty turn over token
+        // connections; a plain greeting reliably triggers the opener.
+        this.client.sendText('Hello');
 
         this.streamer = new AudioStreamer({
           workletUrl: `${BACKEND_URL}/audio-processor.js`,
@@ -1152,6 +1103,7 @@ RULES:
     async _cleanupSession() {
       if (this.cleaningUp) return;
       this.cleaningUp = true;
+      this._savePartialLead();
       this.sessionActive = false;
       this.els.mainBtn.classList.remove('active');
       this.els.mainBtn.textContent = 'START';
@@ -1168,6 +1120,13 @@ RULES:
     async restart() {
       await this._cleanupSession();
       this.leadData = {};
+      this.sessionId = null;
+      this.storedLeadSig = null;
+      this.captureTurn = null;
+      this.emailConfirmed = false;
+      this.turnText = '';
+      this.lastTurnText = '';
+      this._renderBooking();
       this.phaseIndex = -1;
       this._renderPhase();
       this.els.transcript.innerHTML = '';
@@ -1226,6 +1185,12 @@ RULES:
             response = { output: 'captured' };
             break;
           case 'calculate_score':
+            // The Live model sometimes calls this with no arguments; bounce it
+            // back so it retries with values instead of the UI/CRM getting 0/10.
+            if (typeof a.score_out_of_10 !== 'number' || !a.tier || !a.opportunity_1) {
+              response = { error: 'Missing required fields. Call calculate_score again with score_out_of_10, tier, opportunity_1, opportunity_2, opportunity_3 and score_rationale filled in.' };
+              break;
+            }
             Object.assign(this.leadData, {
               score_out_of_10: a.score_out_of_10,
               tier: a.tier,
@@ -1237,12 +1202,27 @@ RULES:
             response = { output: 'displayed' };
             break;
           case 'capture_lead':
-            Object.assign(this.leadData, { name: a.name, email: a.email });
-            response = { output: 'captured' };
+            response = this._captureLead(a);
             break;
           case 'send_to_crm':
-            await this._postLead();
-            response = { output: 'sent' };
+            // The model sometimes skips capture_lead and passes the details here;
+            // capture them first so the confirmation guard still applies.
+            if (a.email || a.name) {
+              const details = {
+                name: a.name || this.leadData.name,
+                email: a.email || this.leadData.email,
+                name_stated_by_user: a.name ? a.name_stated_by_user : true,
+              };
+              const normalized = String(details.email || '').replace(/\s+/g, '').toLowerCase();
+              if (normalized !== this.leadData.email || details.name !== this.leadData.name) {
+                const captured = this._captureLead(details);
+                if (captured.error) { response = captured; break; }
+              }
+            }
+            response = await this._sendLead(a.trigger);
+            break;
+          case 'lookup_soch_info':
+            response = { context: await this._lookupSochInfo(a.query) };
             break;
           default:
             console.warn('[soch] unknown tool', name);
@@ -1255,10 +1235,89 @@ RULES:
       if (this.client) this.client.sendToolResponse(id, name, response);
     }
 
-    async _postLead() {
+    /**
+     * capture_lead: validates the name the prospect stated and the email, and
+     * records them pending confirmation. Only a changed email resets the
+     * confirmation, so re-sending the same details after "yes" isn't blocked.
+     */
+    _captureLead(a) {
+      const name = String(a.name || '').trim();
+      // Speech-to-text sometimes leaves spaces inside spelled-out addresses.
+      const email = String(a.email || '').replace(/\s+/g, '').toLowerCase();
+      if (!name) {
+        return { error: 'missing_name', status: 'not_sent', guidance: internalNote("Nothing was saved or sent, so do not say you passed on or emailed anything. The prospect hasn't given their name yet. Ask for it in your own words, then call capture_lead again with exactly the name they say.") };
+      }
+      if (!EMAIL_RE.test(email)) {
+        return { error: 'invalid_email', status: 'not_sent', guidance: internalNote("Nothing was saved or sent, so do not say you passed on or emailed anything. That email address is not valid. In your own words, ask them to say their email again slowly, then call capture_lead again.") };
+      }
+      if (a.name_stated_by_user === false || (nameLooksDerivedFromEmail(name, email) && a.name_stated_by_user !== true)) {
+        return {
+          error: 'name_unverified',
+          status: 'not_sent',
+          guidance: internalNote("Nothing was saved or sent, so do not say you passed on or emailed anything. The prospect has not told you their name, and it must not be guessed from the email. Ask for their name in your own words, wait, then call capture_lead again with exactly the name they say and name_stated_by_user true."),
+        };
+      }
+      if (email !== this.leadData.email) {
+        // If the bot already read this email back last turn (without calling
+        // capture_lead), the prospect has since answered it, so the read-back
+        // counts; otherwise the send must wait for a read-back this turn.
+        this.captureTurn = textReadsBackEmail(this.lastTurnText, email) ? this.modelTurns - 1 : this.modelTurns;
+        this.emailConfirmed = false;
+      }
+      Object.assign(this.leadData, { name, email });
+      return {
+        output: 'captured_pending_confirmation',
+        name,
+        email,
+        guidance: internalNote(`Saved, pending confirmation. If you have not read the email back yet, read back exactly this address, ${email}, once and ask if it is right, then wait. If you already read it back, do not repeat it: just wait for their answer. As soon as they confirm, call send_to_crm. If they correct it, call capture_lead again with the corrected email.`),
+      };
+    }
+
+    /**
+     * send_to_crm: submits the lead and turns the backend's real result into
+     * what the model is allowed to say. Never reports success it didn't get.
+     */
+    async _sendLead(requestedTrigger) {
       const ld = this.leadData || {};
-      const payload = {
+      if (!ld.name || !EMAIL_RE.test(ld.email || '')) {
+        return {
+          status: 'missing_contact',
+          guidance: internalNote("Nothing was sent because capture_lead has not been called yet. If the prospect already told you their name and email, call capture_lead with them now without asking again, then confirm the email. Otherwise ask only for whichever detail is missing."),
+        };
+      }
+      // The prospect must get a chance to answer the read-back: refuse a send
+      // in the same model turn as capture_lead.
+      if (!this.emailConfirmed && this.modelTurns === this.captureTurn) {
+        return {
+          status: 'needs_confirmation',
+          guidance: internalNote(`Nothing was sent and no email went out, so do not say you emailed them. The prospect has not answered the email read-back yet. If you already read ${ld.email} back to them just now, do not repeat it: stop and wait for their answer. If you have not, read it back once and wait. As soon as they confirm, call send_to_crm.`),
+        };
+      }
+      this.emailConfirmed = true;
+      const trigger = requestedTrigger === 'booking_request' || requestedTrigger === 'diagnostic_complete'
+        ? requestedTrigger
+        : (ld.score_out_of_10 != null ? 'diagnostic_complete' : 'booking_request');
+
+      this._renderBooking(null, 'Sending your details…');
+      const result = await this._postLead(trigger);
+      this._renderBooking(result.booking_link, BOOKING_NOTES[result.status] && BOOKING_NOTES[result.status](ld.email));
+      this._emit('lead_result', result);
+
+      return {
+        status: result.status,
+        email_sent: result.email_sent === true,
+        follow_up_confirmed: result.follow_up_confirmed === true,
+        booking_link_on_screen: true,
+        guidance: internalNote(LEAD_GUIDANCE[result.status] || LEAD_GUIDANCE.failed),
+      };
+    }
+
+    _buildLeadPayload(trigger) {
+      const ld = this.leadData || {};
+      return {
         source: 'voice_diagnostic_widget',
+        session_id: this.sessionId,
+        trigger,
         timestamp: new Date().toISOString(),
         contact: { name: ld.name, email: ld.email },
         company: { name: ld.company_name, team_size: ld.team_size, industry: ld.industry },
@@ -1280,20 +1339,88 @@ RULES:
           rationale: ld.score_rationale,
         },
       };
+    }
+
+    /** Everything except trigger/timestamp — used to tell whether n8n already has the latest data. */
+    _leadSignature(payload) {
+      const { trigger, timestamp, ...rest } = payload;
+      return JSON.stringify(rest);
+    }
+
+    /** POSTs the lead and returns the backend's actual result (never throws). */
+    async _postLead(trigger) {
+      const payload = this._buildLeadPayload(trigger);
       this._emit('lead', payload);
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), LEAD_CLIENT_TIMEOUT_MS);
       try {
-        const ctrl = new AbortController();
-        const timeout = setTimeout(() => ctrl.abort(), 10000);
         const res = await fetch(`${BACKEND_URL}/lead`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
           signal: ctrl.signal,
         });
-        clearTimeout(timeout);
-        if (!res.ok) console.warn('[soch] /lead non-2xx', res.status);
+        let body = null;
+        try { body = await res.json(); } catch (_) { /* non-JSON error page */ }
+        if (!body || typeof body.status !== 'string') {
+          console.warn('[soch] /lead unexpected response', res.status);
+          return { status: 'failed', error: `http_${res.status}`, booking_link: this.bookingUrl };
+        }
+        if (!body.lead_stored) console.warn('[soch] lead not stored:', body.status, body.error || '');
+        else this.storedLeadSig = this._leadSignature(payload);
+        return body;
       } catch (err) {
         console.error('[soch] /lead failed', err);
+        return { status: 'failed', error: err && err.name === 'AbortError' ? 'timeout' : 'network', booking_link: this.bookingUrl };
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    /**
+     * Saves what we have when the conversation ends without the lead having
+     * been sent (or with newer data since it was sent) — but only once we have
+     * a confirmed email, i.e. enough to follow up. n8n stores it as "Partial",
+     * notifies Riz once, and does not email the prospect.
+     */
+    _savePartialLead({ beacon = false } = {}) {
+      const ld = this.leadData || {};
+      // Only an email the prospect confirmed is worth saving — never one that
+      // was misheard and not yet read back.
+      if (!this.sessionId || !this.emailConfirmed || !EMAIL_RE.test(ld.email || '')) return;
+      const payload = this._buildLeadPayload('session_end');
+      const sig = this._leadSignature(payload);
+      if (sig === this.storedLeadSig) return;
+      this.storedLeadSig = sig; // one attempt per distinct payload
+      const body = JSON.stringify(payload);
+      // text/plain keeps sendBeacon/keepalive requests free of a CORS preflight.
+      if (beacon && navigator.sendBeacon) {
+        navigator.sendBeacon(`${BACKEND_URL}/lead`, new Blob([body], { type: 'text/plain' }));
+        return;
+      }
+      fetch(`${BACKEND_URL}/lead`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body, keepalive: true })
+        .then((res) => res.json())
+        .then((r) => { if (!r.lead_stored) this.storedLeadSig = null; })
+        .catch((err) => { this.storedLeadSig = null; console.error('[soch] partial lead failed', err); });
+    }
+
+    async _lookupSochInfo(query) {
+      try {
+        const ctrl = new AbortController();
+        const timeout = setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch(`${BACKEND_URL}/rag/lookup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: query || '' }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timeout);
+        if (!res.ok) throw new Error(`lookup non-2xx: ${res.status}`);
+        const data = await res.json();
+        return data.context || 'No matching information found.';
+      } catch (err) {
+        console.error('[soch] lookup_soch_info failed', err);
+        return "Lookup unavailable right now — tell the prospect that's exactly what the call with Riz is for.";
       }
     }
   }

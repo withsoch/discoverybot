@@ -6,3 +6,4 @@ npm-debug.log*
 *.log
 .vscode/
 .idea/
+data/.embeddings-cache.json

@@ -327,6 +327,36 @@
   padding: 8px 16px;
 }
 
+/* Book-a-call (existing Cal.com 30-min event) */
+#soch-voice-widget .soch-booking {
+  padding: 10px 18px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+#soch-voice-widget .soch-book-btn {
+  display: inline-block;
+  padding: 9px 16px;
+  border-radius: 999px;
+  border: 1px solid #ea6a47;
+  color: #ea6a47;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+#soch-voice-widget .soch-book-btn:hover {
+  background: #ea6a47;
+  color: #ffffff;
+}
+#soch-voice-widget .soch-booking-note {
+  margin: 0;
+  font-size: 11px;
+  color: #aaa;
+  text-align: center;
+}
+
 /* Mobile */
 @media (max-width: 480px) {
   #soch-voice-widget .soch-panel {
