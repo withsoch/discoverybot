@@ -51,6 +51,17 @@ Visit `http://localhost:3000`, click the pill, then **START**.
 
 ---
 
+## Deploy to Vercel
+
+The app deploys to Vercel with zero config: Vercel detects `server.js` (Express with `app.listen`) and runs it as one Vercel Function on Fluid compute. The browser talks to Gemini Live directly over `wss://` with an ephemeral token, so no WebSocket server is needed.
+
+- **Static files** — Vercel ignores `express.static` and serves `public/` from its CDN; `vercel.json` adds the same headers the Express server sets locally (`Access-Control-Allow-Origin: *`, which the AudioWorklet needs when the widget is embedded on another domain, plus short cache times).
+- **RAG** — `data/.embeddings-cache.json` is committed and loaded with `require()`, so it's bundled with the function and a cold start makes no embedding calls. If the knowledge base changes, rebuild the cache locally (`npm start` re-embeds only changed chunks) and commit it. On Vercel's read-only filesystem the cache write is skipped with a warning and lookups still work.
+- **Environment variables** — set in the Vercel project (Production): `GEMINI_API_KEY`, `GEMINI_MODEL` (set it explicitly — the code default is a different model), `N8N_WEBHOOK_URL`, `N8N_WEBHOOK_SECRET`, `CAL_BOOKING_URL`. Don't set `PORT`. `.vercelignore` keeps `.env` out of CLI uploads.
+- **Timeouts** — `/lead` waits up to 25 s for n8n; Fluid compute's default maximum duration covers that.
+- **In-memory state** — rate limits and the in-flight lead de-duplication are per function instance on Vercel, so limits are looser across instances; n8n still de-duplicates leads by `session_id`.
+- After deploying, embed with the deployment's domain: `<script src="https://<your-vercel-domain>/widget.js" defer></script>`.
+
 ## Webflow embed
 
 In Webflow, open **Project Settings → Custom Code → Footer Code** (or drop a Custom Code embed onto a single page) and paste:
@@ -122,10 +133,12 @@ Browser (widget.js + audio-processor.js)
 | `server.js` | Express app: serves frontend, mints ephemeral tokens (locked to model + AUDIO modality, returns the booking URL), RAG lookup endpoint, validates leads and forwards them to n8n with a secret header and one timeout budget, and maps n8n's per-step flags to a truthful status. Rate-limits `/token`, `/rag/lookup` and `/lead`. |
 | `prompt.js` | System prompt + tool declarations (locked into each ephemeral token). |
 | `rag.js`, `data/knowledge.js` | RAG retriever + knowledge base for `lookup_soch_info`. |
-| `frontend/widget.js` | Single-file bundle: AudioStreamer + AudioPlayer + GeminiLiveClient + UI controller. ~50KB unminified. |
-| `frontend/audio-processor.js` | Standalone AudioWorklet processor (must be served at its own URL). |
-| `frontend/widget.css` | Namespaced styles. |
-| `frontend/index.html` | Local-dev test harness. |
+| `public/widget.js` | Single-file bundle: AudioStreamer + AudioPlayer + GeminiLiveClient + UI controller. ~50KB unminified. |
+| `public/audio-processor.js` | Standalone AudioWorklet processor (must be served at its own URL). |
+| `public/widget.css` | Namespaced styles. |
+| `public/index.html` | Local-dev test harness. |
+| `vercel.json` | Vercel headers for `public/` (CORS + cache), replacing what `express.static` sets locally. |
+| `data/.embeddings-cache.json` | Precomputed KB embeddings, committed so deploys make no embedding calls at startup. |
 
 ### Wire format
 

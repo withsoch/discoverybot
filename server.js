@@ -65,10 +65,12 @@ app.use(cors({ origin: true, credentials: false, maxAge: 86400 }));
 app.use(express.json({ limit: '64kb' }));
 
 // ---- Static assets (widget.js, widget.css, audio-processor.js, etc.) ------
+// Local/Node hosting only: on Vercel, public/ is served by the CDN instead
+// (express.static is ignored there) with the same headers set in vercel.json.
 // Long cache for the worklet and CSS; the JS is hashless so we keep it short
 // to make widget rollouts visible quickly.
 app.use(
-  express.static(path.join(__dirname, 'frontend'), {
+  express.static(path.join(__dirname, 'public'), {
     etag: true,
     lastModified: true,
     setHeaders: (res, filePath) => {
@@ -105,7 +107,7 @@ app.get('/token', tokenLimiter, async (req, res) => {
         newSessionExpireTime: new Date(now + SESSION_START_TTL_MS).toISOString(),
         liveConnectConstraints: {
           // Must exactly match the model string the client sends in its
-          // `setup` message (frontend/widget.js prefixes with `models/`),
+          // `setup` message (public/widget.js prefixes with `models/`),
           // or Gemini closes the socket right after connecting (code 1007).
           model: GEMINI_MODEL.startsWith('models/') ? GEMINI_MODEL : `models/${GEMINI_MODEL}`,
           // Everything the session needs must be here: over a token
@@ -367,7 +369,7 @@ app.post('/lead', leadLimiter, express.text({ type: 'text/plain', limit: '64kb' 
 });
 
 // ---- Misc ---------------------------------------------------------------
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'frontend', 'index.html')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.get('/healthz', (req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 
 app.listen(PORT, () => {

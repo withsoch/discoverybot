@@ -133,6 +133,27 @@
     return head.length > 0 && spoken.includes(head) && spoken.includes(alnum(domain || ''));
   }
 
+  // The model records discovery details as they come up and may call a capture
+  // tool again with only the new fields, so omitted fields keep earlier values.
+  function mergeDefined(target, fields) {
+    for (const [k, v] of Object.entries(fields)) {
+      if (v !== undefined && v !== null && v !== '') target[k] = v;
+    }
+  }
+
+  // Discovery must cover these before calculate_score may run.
+  const DISCOVERY_REQUIRED = [
+    ['industry', 'what the company does'],
+    ['team_size', 'team size'],
+    ['main_processes', 'the main recurring work'],
+    ['tools_used', 'the tools they use'],
+    ['main_bottleneck', 'where work slows down'],
+  ];
+
+  // "your team scores a 7 out of 10": a score said aloud (used to catch one
+  // spoken without calling calculate_score).
+  const SPOKEN_SCORE_RE = /\bscor(e|es|ed|ing)\b[^.?!]{0,40}?\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s*(out of|\/)\s*(10|ten)\b/i;
+
   function newSessionId() {
     const raw = (window.crypto && crypto.randomUUID)
       ? crypto.randomUUID()
@@ -402,7 +423,7 @@
         onAudio: opts.onAudio || (() => {}),
         onUserTranscript: opts.onUserTranscript || (() => {}),
         onModelTranscript: opts.onModelTranscript || (() => {}),
-        onToolCall: opts.onToolCall || (() => {}),
+        onToolCalls: opts.onToolCalls || (() => {}),
         onTurnComplete: opts.onTurnComplete || (() => {}),
         onModelTurnEnd: opts.onModelTurnEnd || (() => {}),
         onInterrupted: opts.onInterrupted || (() => {}),
@@ -520,9 +541,7 @@
       }
 
       if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
-        for (const call of msg.toolCall.functionCalls) {
-          this.cb.onToolCall(call);
-        }
+        this.cb.onToolCalls(msg.toolCall.functionCalls);
       }
       if (msg.goAway) this.cb.onGoAway(msg.goAway);
     }
@@ -547,14 +566,17 @@
       }));
     }
 
-    sendToolResponse(id, name, response) {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // All responses to one toolCall message go back together: each separate
+    // toolResponse makes the model resume speaking, so replying one by one
+    // made it repeat itself after multi-tool turns.
+    sendToolResponses(results) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !results.length) return;
       this.ws.send(JSON.stringify({
         toolResponse: {
-          functionResponses: [{
+          functionResponses: results.map(({ id, name, response }) => ({
             id, name,
             response: typeof response === 'object' ? response : { output: response },
-          }],
+          })),
         },
       }));
     }
@@ -712,6 +734,7 @@
       // Email confirmation guard: send_to_crm is only allowed once the model has
       // ended at least one turn (read the email back) since capture_lead.
       this.modelTurns = 0;
+      this.scoreNudged = false;    // asked the model once to record a score it only spoke
       this.turnText = '';          // what the bot has said in the current turn
       this.lastTurnText = '';      // …and in the previous one
       this.captureTurn = null;
@@ -982,7 +1005,7 @@
           onAudio: (b64) => this.player.enqueue(b64).catch(console.error),
           onUserTranscript: (t, fin) => this.appendUserTranscript(t, fin),
           onModelTranscript: (t, fin) => { this.turnText += t; this.appendModelTranscript(t, fin); },
-          onToolCall: (call) => this._handleToolCall(call),
+          onToolCalls: (calls) => this._handleToolCalls(calls),
           onTurnComplete: () => {
             // Don't reset bubbles here — `finished` flag does that. We just
             // refresh the status indicator if the model isn't speaking.
@@ -991,7 +1014,7 @@
               this._setBarsMode(this.userSpeaking ? 'user' : 'idle');
             }
           },
-          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; },
+          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; this._checkSpokenScore(); },
           onInterrupted: () => { if (this.player) this.player.interrupt(); },
           onOpen: () => this.setStatus('Listening…'),
           onClose: () => {
@@ -1126,6 +1149,7 @@
       this.emailConfirmed = false;
       this.turnText = '';
       this.lastTurnText = '';
+      this.scoreNudged = false;
       this._renderBooking();
       this.phaseIndex = -1;
       this._renderPhase();
@@ -1150,41 +1174,68 @@
     }
 
     // ───── Tool call handling ─────
+    // Calls in one message run in order (capture_lead before send_to_crm) and
+    // are answered in a single toolResponse.
+    async _handleToolCalls(calls) {
+      const results = [];
+      for (const call of calls) {
+        const { id, name } = call || {};
+        results.push({ id, name, response: await this._handleToolCall(call) });
+      }
+      if (this.client) this.client.sendToolResponses(results);
+    }
+
     async _handleToolCall(call) {
-      const { id, name, args } = call || {};
+      const { name, args } = call || {};
       const a = args || {};
       let response = { output: 'success' };
       try {
         switch (name) {
           case 'capture_company_info':
-            Object.assign(this.leadData, {
+            mergeDefined(this.leadData, {
               company_name: a.company_name,
               team_size: a.team_size,
               industry: a.industry,
             });
             this.advancePhase(1);
-            response = { output: 'captured' };
+            response = this._discoveryStatus();
             break;
           case 'capture_operations_data':
-            Object.assign(this.leadData, {
+            mergeDefined(this.leadData, {
               main_processes: a.main_processes,
               highest_frequency_task: a.highest_frequency_task,
               tools_used: a.tools_used,
               tool_count: a.tool_count,
             });
             this.advancePhase(2);
-            response = { output: 'captured' };
+            response = this._discoveryStatus();
             break;
           case 'capture_pain_points':
-            Object.assign(this.leadData, {
+            mergeDefined(this.leadData, {
               main_bottleneck: a.main_bottleneck,
               automation_dream: a.automation_dream,
               pain_specificity: a.pain_specificity,
             });
             this.advancePhase(3);
-            response = { output: 'captured' };
+            response = this._discoveryStatus();
             break;
-          case 'calculate_score':
+          case 'calculate_score': {
+            // Scored once, only at the end of discovery: a call while required
+            // details are missing (or after the score is shown) is refused, so
+            // nothing is scored or revealed mid-conversation.
+            if (this.leadData.score_out_of_10 != null) {
+              response = { output: 'already_displayed', guidance: internalNote('The score was already calculated and shown. Do not calculate it again; carry on from where you are.') };
+              break;
+            }
+            const missing = this._missingDiscovery();
+            if (missing.length) {
+              response = {
+                error: 'discovery_incomplete',
+                missing,
+                guidance: internalNote(`Nothing was scored or shown: discovery isn't finished. Still missing: ${missing.join(', ')}. If the prospect already told you any of these, call the matching capture tool with what they said. Otherwise keep the conversation going and ask about one missing area naturally. Do not mention a score or readiness level. Call calculate_score again only when everything is covered.`),
+              };
+              break;
+            }
             // The Live model sometimes calls this with no arguments; bounce it
             // back so it retries with values instead of the UI/CRM getting 0/10.
             if (typeof a.score_out_of_10 !== 'number' || !a.tier || !a.opportunity_1) {
@@ -1199,8 +1250,11 @@
             });
             this.showScore(a);
             this.advancePhase(4);
-            response = { output: 'displayed' };
+            response = this.scoreNudged
+              ? { output: 'displayed', guidance: internalNote("It's now on screen. You already told them the score, so don't repeat it; carry on from where you were.") }
+              : { output: 'displayed' };
             break;
+          }
           case 'capture_lead':
             response = this._captureLead(a);
             break;
@@ -1232,7 +1286,49 @@
         console.error('[soch] tool handler error', name, err);
         response = { output: 'error' };
       }
-      if (this.client) this.client.sendToolResponse(id, name, response);
+      return response;
+    }
+
+    /**
+     * Safety net: if the model said a score out loud without calling
+     * calculate_score, nothing reached the screen or the CRM. Ask it once to
+     * record that same score now (the discovery guard still applies).
+     */
+    _checkSpokenScore() {
+      if (this.scoreNudged || this.leadData.score_out_of_10 != null || !this.client) return;
+      if (!SPOKEN_SCORE_RE.test(this.lastTurnText)) return;
+      this.scoreNudged = true;
+      this.client.sendText(internalNote("You just told the prospect a score, but calculate_score was never called, so nothing is shown on their screen or saved. Call calculate_score now with exactly the score, tier and opportunities you said. Don't say anything to the prospect about this."));
+    }
+
+    _missingDiscovery() {
+      return DISCOVERY_REQUIRED.filter(([k]) => !this.leadData[k]).map(([, label]) => label);
+    }
+
+    /**
+     * Reply to the capture_* tools. It tells the model whether discovery is
+     * complete, so it scores (with the tool) as soon as it is, and never before;
+     * it also stops the model re-speaking what it said before the tool call.
+     */
+    _discoveryStatus() {
+      const noRepeat = "Recorded silently. Don't comment on it, and don't repeat anything you already said this turn; if you've already asked your question, stop and wait for their answer.";
+      if (this.leadData.score_out_of_10 != null) {
+        return { output: 'captured', guidance: internalNote(noRepeat) };
+      }
+      const missing = this._missingDiscovery();
+      if (missing.length) {
+        return {
+          output: 'captured',
+          discovery_complete: false,
+          missing,
+          guidance: internalNote(`${noRepeat} Discovery isn't finished (still to learn: ${missing.join(', ')}), so don't mention any score. Carry on the conversation naturally.`),
+        };
+      }
+      return {
+        output: 'captured',
+        discovery_complete: true,
+        guidance: internalNote(`${noRepeat} You now have everything needed for the score. If you haven't yet learned what they'd most like to happen automatically, ask that one question. Otherwise your next action is to call calculate_score, before you say anything about a score; a score you only say out loud is never shown or saved.`),
+      };
     }
 
     /**

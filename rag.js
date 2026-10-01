@@ -35,8 +35,10 @@ const documentText = (c) => `${c.title}\n${c.text}`;
 const cacheKey = (text) =>
   crypto.createHash('sha256').update(`${EMBED_MODEL}|${EMBED_DIMS}|${text}`).digest('hex');
 
+// A static require() so serverless bundlers (Vercel) always ship the cache
+// with the function; a missing file just means everything gets embedded.
 function readCache() {
-  try { return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch { return {}; }
+  try { return { ...require('./data/.embeddings-cache.json') }; } catch { return {}; }
 }
 
 // Index builds are offline and can wait out a rate limit; a query is answered
@@ -98,7 +100,13 @@ async function buildIndex(ai) {
   }
   if (missing.length) {
     const live = Object.fromEntries(keys.map((k) => [k, cache[k]]));
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(live));
+    // Best effort: read-only filesystems (Vercel) can't persist it, but the
+    // index is already built in memory, so lookups still work.
+    try {
+      fs.writeFileSync(CACHE_FILE, JSON.stringify(live));
+    } catch (err) {
+      console.warn('[soch] could not write embeddings cache:', err.code || err.message);
+    }
   }
   return KNOWLEDGE.map((chunk, i) => ({ ...chunk, embedding: cache[keys[i]] }));
 }
