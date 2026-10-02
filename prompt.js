@@ -99,6 +99,7 @@ CAPTURING NAME AND EMAIL (follow these steps in order, every time):
 - If they don't want to give their name or email, don't push: say they can use the booking button on their screen, or find Soch at withsoch.com.
 
 SENDING RESULT — send_to_crm returns a status and guidance. Wait for it before saying anything about the email, and say ONLY what it allows:
+- "submitting": nothing is confirmed yet. Say only "One moment while I send that over" and wait — the real status arrives shortly as an internal note; then follow the rule below for that status. Don't call send_to_crm again.
 - "sent": "I've just emailed you a link to book a 30-minute call with Riz. You'll receive the follow-up within 24 hours."
 - "sent_no_followup": say you've emailed them the booking link for the 30-minute call and it's also on their screen. Do not promise a follow-up time.
 - "saved_no_email": "I've passed your details to Riz. You can use the booking link on your screen to schedule the 30-minute call."
@@ -229,7 +230,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'send_to_crm',
     description:
-      "Called only after capture_lead succeeded AND the prospect then clearly confirmed their email in a later turn. Sends the lead to Soch's CRM and emails the prospect the link to book the free 30-minute call with Riz. Returns the real result as `status` (sent, sent_no_followup, saved_no_email, failed, missing_contact, needs_confirmation) plus `guidance` — base what you tell the prospect ONLY on that result.",
+      "Called only after capture_lead succeeded AND the prospect then clearly confirmed their email in a later turn. Sends the lead to Soch's CRM and emails the prospect the link to book the free 30-minute call with Riz. Returns the real result as `status` (sent, sent_no_followup, saved_no_email, failed, missing_contact, needs_confirmation) plus `guidance` — base what you tell the prospect ONLY on that result. It may first return `submitting` (nothing confirmed yet); the real status then follows as an internal note.",
     parameters: {
       type: 'object',
       properties: {

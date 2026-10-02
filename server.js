@@ -30,6 +30,17 @@ const SESSION_START_TTL_MS = Number(process.env.SESSION_START_TTL_MS) || 2 * 60 
 // widget waits LEAD_TIMEOUT_MS + a few seconds, so it always hears back.
 // A first-time lead measured ~15 s end to end in n8n (Sheets upsert alone ~8 s).
 const LEAD_TIMEOUT_MS = Number(process.env.LEAD_TIMEOUT_MS) || 25000;
+// Silence (ms) after which Gemini's voice activity detection ends the user's
+// turn. The server default is ~800 ms; lower answers faster but can cut off
+// someone pausing mid-sentence.
+const VAD_SILENCE_MS = Number(process.env.VAD_SILENCE_MS) || 600;
+
+// Thinking adds latency before the first audio. Gemini 2.5 models take a
+// token budget (0 = off); Gemini 3.x models take a level instead and reject
+// mixing the two, so pick the setting the configured model supports.
+function thinkingConfigFor(model) {
+  return /gemini-2\.5/.test(model) ? { thinkingBudget: 0 } : { thinkingLevel: 'minimal' };
+}
 
 // Treat the .env.example placeholder as "not configured" so a copied example
 // file can never look like a working integration.
@@ -114,6 +125,15 @@ app.get('/token', tokenLimiter, async (req, res) => {
           // connection Gemini ignores systemInstruction/tools from the client.
           config: {
             responseModalities: ['AUDIO'],
+            // SDK 1.20 has no top-level thinkingConfig for Live; generationConfig
+            // is passed through to the setup as-is.
+            generationConfig: { thinkingConfig: thinkingConfigFor(GEMINI_MODEL) },
+            realtimeInputConfig: {
+              automaticActivityDetection: {
+                endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+                silenceDurationMs: VAD_SILENCE_MS,
+              },
+            },
             systemInstruction: SYSTEM_PROMPT,
             tools: [{ functionDeclarations: TOOL_DEFINITIONS }],
             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } },
