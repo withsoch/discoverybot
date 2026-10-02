@@ -2,7 +2,7 @@
  *
  * Every selector is scoped under #soch-voice-widget so styles cannot leak
  * into the host page (Webflow templates, withsoch.com, etc.). Visibility
- * uses the standard [hidden] attribute rather than a custom !important class.
+ * uses the standard [hidden] attribute rather than a custom class.
  */
 
 #soch-voice-widget,
@@ -11,7 +11,9 @@
   font-family: 'DM Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
 
-#soch-voice-widget [hidden] { display: none; }
+/* !important: `#soch-voice-widget .soch-cta { display: flex }` and friends
+ * have the same specificity and come later, so they'd otherwise win. */
+#soch-voice-widget [hidden] { display: none !important; }
 
 #soch-voice-widget {
   position: fixed;
