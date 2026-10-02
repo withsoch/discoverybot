@@ -357,6 +357,55 @@
   text-align: center;
 }
 
+/* Typed-email fallback (shown when the bot asks for an email) */
+#soch-voice-widget .soch-email-form {
+  padding: 8px 18px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#soch-voice-widget .soch-email-label {
+  font-size: 11px;
+  color: #aaa;
+}
+#soch-voice-widget .soch-email-row {
+  display: flex;
+  gap: 6px;
+}
+#soch-voice-widget .soch-email-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid #2a2a2a;
+  background: #111;
+  color: #ffffff;
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+#soch-voice-widget .soch-email-input:focus { border-color: #ea6a47; }
+#soch-voice-widget .soch-email-submit {
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid #ea6a47;
+  background: transparent;
+  color: #ea6a47;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#soch-voice-widget .soch-email-submit:hover {
+  background: #ea6a47;
+  color: #ffffff;
+}
+#soch-voice-widget .soch-email-msg {
+  margin: 0;
+  font-size: 11px;
+  color: #aaa;
+}
+
 /* Mobile */
 @media (max-width: 480px) {
   #soch-voice-widget .soch-panel {

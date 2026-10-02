@@ -67,6 +67,13 @@
     saved_no_email: "Their details were saved but the email did NOT send. Say you've passed their details to Riz and they can use the booking link on their screen to schedule the 30-minute call. Do NOT say you emailed them and do NOT mention 24 hours.",
     failed: "Their details could NOT be sent. Say you couldn't send their details through just now, and that they can use the booking link on their screen to schedule the call, or contact info@withsoch.com. Do NOT say you emailed them, that Riz has their details, or that anything is booked. Do NOT mention 24 hours.",
   };
+  // send_to_crm answers right away while n8n runs (2–18 s); the real result
+  // reaches the model afterwards as an internal note.
+  const LEAD_SUBMITTING_GUIDANCE = "Their details are being sent right now and nothing is confirmed yet. Say only a short \"One moment while I send that over\", then stop and wait. Do NOT say you've emailed them, that Riz has their details, or that anything is booked. The real result will reach you in a moment as an internal note; don't call send_to_crm again.";
+  // An internal note waits for the model to finish its turn, but never longer than this.
+  const NOTE_MAX_WAIT_MS = 8000;
+  // The bot asking for an email ("What's your name and email…?").
+  const EMAIL_ASK_RE = /\b(your|and)\s+e-?mail\b|\be-?mail\b[^.!]*\?/i;
   // Matching on-screen note under the Book-a-Call button.
   const BOOKING_NOTES = {
     sent: (email) => `Booking link sent to ${email}. You can also book here.`,
@@ -481,6 +488,7 @@
         onUserTranscript: opts.onUserTranscript || (() => {}),
         onModelTranscript: opts.onModelTranscript || (() => {}),
         onToolCalls: opts.onToolCalls || (() => {}),
+        onToolCallCancellation: opts.onToolCallCancellation || (() => {}),
         onTurnComplete: opts.onTurnComplete || (() => {}),
         onModelTurnEnd: opts.onModelTurnEnd || (() => {}),
         onInterrupted: opts.onInterrupted || (() => {}),
@@ -600,6 +608,11 @@
       if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
         this.cb.onToolCalls(msg.toolCall.functionCalls);
       }
+      // The user spoke while tool calls were pending: Gemini dropped them and
+      // their responses must not be sent.
+      if (msg.toolCallCancellation && Array.isArray(msg.toolCallCancellation.ids)) {
+        this.cb.onToolCallCancellation(msg.toolCallCancellation.ids);
+      }
       if (msg.goAway) this.cb.onGoAway(msg.goAway);
     }
 
@@ -718,6 +731,17 @@
 
         <div class="soch-error" hidden></div>
 
+        <form class="soch-email-form" hidden novalidate>
+          <label class="soch-email-label">Prefer to type your email?
+            <div class="soch-email-row">
+              <input class="soch-email-input" type="email" inputmode="email" autocomplete="email"
+                autocapitalize="off" spellcheck="false" maxlength="254" placeholder="you@company.com" />
+              <button class="soch-email-submit" type="submit">Use this</button>
+            </div>
+          </label>
+          <p class="soch-email-msg" hidden></p>
+        </form>
+
         <div class="soch-booking" hidden>
           <a class="soch-book-btn" href="#" target="_blank" rel="noopener noreferrer">Book a 30-min call with Riz</a>
           <p class="soch-booking-note" hidden></p>
@@ -771,6 +795,9 @@
         booking: $('.soch-booking'),
         bookBtn: $('.soch-book-btn'),
         bookingNote: $('.soch-booking-note'),
+        emailForm: $('.soch-email-form'),
+        emailInput: $('.soch-email-input'),
+        emailMsg: $('.soch-email-msg'),
         mic: $('.soch-mic'),
         mainBtn: $('.soch-main-btn'),
         restart: $('.soch-restart'),
@@ -797,6 +824,13 @@
       this.lastTurnText = '';      // …and in the previous one
       this.captureTurn = null;
       this.emailConfirmed = false;
+      this.typedEmail = null;      // address typed in the on-screen box; beats one heard over speech
+      this.leadInFlight = false;   // a send_to_crm submission is waiting on n8n
+      this.lastLeadResult = null;  // { sig, trigger, result } of the last stored submission
+      this.cancelledToolIds = new Set();
+      this.modelTurnOpen = false;  // model is generating; internal notes wait for its turn to end
+      this.pendingNotes = [];
+      this.noteTimer = null;
       this.client = null;
       this.streamer = null;
       this.player = null;
@@ -841,6 +875,7 @@
       this.els.mic.addEventListener('click', () => this.toggleMute());
       this.els.restart.addEventListener('click', () => this.restart());
       this.els.bookBtn.addEventListener('click', () => this._emit('booking_click', { session_id: this.sessionId }));
+      this.els.emailForm.addEventListener('submit', (e) => { e.preventDefault(); this._onTypedEmail(); });
       // Last chance to save a partial lead when the visitor closes the tab.
       window.addEventListener('pagehide', () => this._savePartialLead({ beacon: true }));
     }
@@ -857,6 +892,60 @@
       this.els.booking.hidden = false;
       this.els.bookingNote.textContent = note || '';
       this.els.bookingNote.hidden = !note;
+    }
+
+    /** Shows the typed-email fallback unless the lead has already been stored. */
+    _showEmailInput() {
+      if (!this.sessionActive || this.lastLeadResult || !this.els.emailForm.hidden) return;
+      this.els.emailForm.hidden = false;
+    }
+
+    _hideEmailInput() {
+      this.els.emailForm.hidden = true;
+      this.els.emailMsg.hidden = true;
+    }
+
+    _setEmailMsg(text) {
+      this.els.emailMsg.textContent = text;
+      this.els.emailMsg.hidden = !text;
+    }
+
+    /**
+     * The prospect typed their email. It goes through the normal capture flow
+     * (capture_lead → read-back → confirm → send_to_crm); _captureLead swaps
+     * it in for whatever address the model heard.
+     */
+    _onTypedEmail() {
+      const email = this.els.emailInput.value.replace(/\s+/g, '').toLowerCase();
+      if (!EMAIL_RE.test(email)) {
+        this._setEmailMsg("That doesn't look like a full email address.");
+        return;
+      }
+      if (!this.sessionActive || !this.client) return;
+      this.typedEmail = email;
+      this._setEmailMsg(`Got it: ${email}`);
+      this._sendNote(`The prospect typed their email address in the on-screen box: ${email}. It is exactly right, so use it instead of anything you heard. Carry on with CAPTURING NAME AND EMAIL as usual: if they have told you their name, call capture_lead now with this email; otherwise ask for their name first. Then read the email back once, ask them to confirm, and wait.`);
+    }
+
+    /**
+     * Sends an internal note to the model once it isn't mid-turn (a note sent
+     * while it is generating would cut it off), or after NOTE_MAX_WAIT_MS in
+     * case the turn end never arrives.
+     */
+    _sendNote(text) {
+      this.pendingNotes.push(text);
+      if (!this.modelTurnOpen) { this._flushNotes(); return; }
+      if (!this.noteTimer) this.noteTimer = setTimeout(() => this._flushNotes(), NOTE_MAX_WAIT_MS);
+    }
+
+    _flushNotes() {
+      clearTimeout(this.noteTimer);
+      this.noteTimer = null;
+      const texts = this.pendingNotes.splice(0);
+      if (!this.client || !texts.length) return;
+      // One turn for all of them, so the model answers once.
+      this.discovery.nudges++;
+      this.client.sendText(texts.map(internalNote).join('\n\n'));
     }
 
     open() {
@@ -1060,10 +1149,19 @@
 
         this.client = new GeminiLiveClient({
           model,
-          onAudio: (b64) => this.player.enqueue(b64).catch(console.error),
+          onAudio: (b64) => { this.modelTurnOpen = true; this.player.enqueue(b64).catch(console.error); },
           onUserTranscript: (t, fin) => this.appendUserTranscript(t, fin),
-          onModelTranscript: (t, fin) => { this.turnText += t; this.appendModelTranscript(t, fin); },
-          onToolCalls: (calls) => this._handleToolCalls(calls),
+          onModelTranscript: (t, fin) => {
+            this.modelTurnOpen = true;
+            this.turnText += t;
+            this.appendModelTranscript(t, fin);
+            if (EMAIL_ASK_RE.test(this.turnText)) this._showEmailInput();
+          },
+          onToolCalls: (calls) => { this.modelTurnOpen = true; this._handleToolCalls(calls); },
+          onToolCallCancellation: (ids) => {
+            console.warn('[soch] tool calls cancelled', ids);
+            for (const id of ids) this.cancelledToolIds.add(id);
+          },
           onTurnComplete: () => {
             // Don't reset bubbles here — `finished` flag does that. We just
             // refresh the status indicator if the model isn't speaking.
@@ -1072,8 +1170,13 @@
               this._setBarsMode(this.userSpeaking ? 'user' : 'idle');
             }
           },
-          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; if (!this._checkSpokenScore()) this._enforceFollowUpLimit(); },
-          onInterrupted: () => { if (this.player) this.player.interrupt(); },
+          onModelTurnEnd: () => {
+            this.modelTurns++; this.modelTurnOpen = false;
+            this.lastTurnText = this.turnText; this.turnText = '';
+            if (!this._checkSpokenScore()) this._enforceFollowUpLimit();
+            if (this.pendingNotes.length) this._flushNotes();
+          },
+          onInterrupted: () => { this.modelTurnOpen = false; if (this.player) this.player.interrupt(); },
           onOpen: () => this.setStatus('Listening…'),
           onClose: () => {
             if (this.sessionActive && !this.cleaningUp) {
@@ -1195,6 +1298,12 @@
       this.streamer = this.client = this.player = null;
       this.userBubble = this.modelBubble = null;
       this.aiSpeaking = this.userSpeaking = false;
+      clearTimeout(this.noteTimer);
+      this.noteTimer = null;
+      this.pendingNotes = [];
+      this.modelTurnOpen = false;
+      this.cancelledToolIds.clear();
+      this._hideEmailInput();
       this.cleaningUp = false;
     }
 
@@ -1205,6 +1314,10 @@
       this.storedLeadSig = null;
       this.captureTurn = null;
       this.emailConfirmed = false;
+      this.typedEmail = null;
+      this.lastLeadResult = null;
+      this.leadInFlight = false;
+      this.els.emailInput.value = '';
       this.turnText = '';
       this.lastTurnText = '';
       this.scoreNudged = false;
@@ -1241,7 +1354,15 @@
         const { id, name } = call || {};
         results.push({ id, name, response: await this._handleToolCall(call) });
       }
-      if (this.client) this.client.sendToolResponses(results);
+      // Gemini already discarded cancelled calls; answering them anyway could
+      // make it act on a stale result. Their side effects (captured details,
+      // an in-flight lead) still stand.
+      const live = results.filter((r) => !this.cancelledToolIds.has(r.id));
+      if (live.length < results.length) {
+        console.warn('[soch] not answering cancelled tool calls',
+          results.filter((r) => this.cancelledToolIds.has(r.id)).map((r) => r.name));
+      }
+      if (this.client) this.client.sendToolResponses(live);
     }
 
     async _handleToolCall(call) {
@@ -1318,6 +1439,7 @@
             });
             this.showScore({ ...a, score_out_of_10: result.score, tier: result.tier });
             this.advancePhase(4);
+            this._showEmailInput(); // the score delivery ends by asking for name and email
             const spoken = `${result.score} out of 10, ${result.tier}`;
             response = {
               output: 'displayed',
@@ -1330,6 +1452,7 @@
             break;
           }
           case 'capture_lead':
+            this._showEmailInput();
             response = this._captureLead(a);
             break;
           case 'send_to_crm':
@@ -1469,7 +1592,12 @@
     _captureLead(a) {
       const name = String(a.name || '').trim();
       // Speech-to-text sometimes leaves spaces inside spelled-out addresses.
-      const email = String(a.email || '').replace(/\s+/g, '').toLowerCase();
+      const heard = String(a.email || '').replace(/\s+/g, '').toLowerCase();
+      // An address the prospect typed beats one heard over speech.
+      const email = this.typedEmail || heard;
+      const typedNote = this.typedEmail && heard !== this.typedEmail
+        ? `The prospect typed ${email} in the on-screen box, so that is the address saved, not the one you heard. If they want a different address, ask them to type it in the box. `
+        : '';
       if (!name) {
         return { error: 'missing_name', status: 'not_sent', guidance: internalNote("Nothing was saved or sent, so do not say you passed on or emailed anything. The prospect hasn't given their name yet. Ask for it in your own words, then call capture_lead again with exactly the name they say.") };
       }
@@ -1495,7 +1623,7 @@
         output: 'captured_pending_confirmation',
         name,
         email,
-        guidance: internalNote(`Saved, pending confirmation. If you have not read the email back yet, read back exactly this address, ${email}, once and ask if it is right, then wait. If you already read it back, do not repeat it: just wait for their answer. As soon as they confirm, call send_to_crm. If they correct it, call capture_lead again with the corrected email.`),
+        guidance: internalNote(`${typedNote}Saved, pending confirmation. If you have not read the email back yet, read back exactly this address, ${email}, once and ask if it is right, then wait. If you already read it back, do not repeat it: just wait for their answer. As soon as they confirm, call send_to_crm. If they correct it, call capture_lead again with the corrected email.`),
       };
     }
 
@@ -1524,18 +1652,47 @@
         ? requestedTrigger
         : (ld.score_out_of_10 != null ? 'diagnostic_complete' : 'booking_request');
 
-      this._renderBooking(null, 'Sending your details…');
-      const result = await this._postLead(trigger);
-      this._renderBooking(result.booking_link, BOOKING_NOTES[result.status] && BOOKING_NOTES[result.status](ld.email));
-      this._emit('lead_result', result);
+      if (this.leadInFlight) {
+        return { status: 'submitting', booking_link_on_screen: true, guidance: internalNote(LEAD_SUBMITTING_GUIDANCE) };
+      }
+      // These exact details were already stored for this trigger: report that
+      // result instead of submitting (and announcing) it a second time.
+      const sig = this._leadSignature(this._buildLeadPayload(trigger));
+      const last = this.lastLeadResult;
+      if (last && last.sig === sig && last.trigger === trigger) {
+        return {
+          status: last.result.status,
+          booking_link_on_screen: true,
+          guidance: internalNote(`Already sent; nothing new was submitted. If you've already told them the result, don't repeat it and carry on. Otherwise: ${LEAD_GUIDANCE[last.result.status] || LEAD_GUIDANCE.failed}`),
+        };
+      }
 
-      return {
-        status: result.status,
-        email_sent: result.email_sent === true,
-        follow_up_confirmed: result.follow_up_confirmed === true,
-        booking_link_on_screen: true,
-        guidance: internalNote(LEAD_GUIDANCE[result.status] || LEAD_GUIDANCE.failed),
-      };
+      // n8n takes 2–18 s, so don't hold the tool call (the model would sit
+      // silent): answer "submitting" now and hand the model the real result
+      // as soon as it arrives. Nothing is claimed until then.
+      this._renderBooking(null, 'Sending your details…');
+      this.leadInFlight = true;
+      const sessionId = this.sessionId;
+      const client = this.client;
+      this._postLead(trigger).then((result) => {
+        if (this.sessionId !== sessionId) return; // restarted meanwhile
+        this.leadInFlight = false;
+        this._renderBooking(result.booking_link, BOOKING_NOTES[result.status] && BOOKING_NOTES[result.status](ld.email));
+        this._emit('lead_result', result);
+        if (result.lead_stored) {
+          this.lastLeadResult = { sig, trigger, result };
+          this._hideEmailInput();
+        }
+        // Only the Gemini session that asked can act on the result.
+        if (this.client && this.client === client) {
+          this._sendNote(`The send_to_crm result is in: status "${result.status}". ${LEAD_GUIDANCE[result.status] || LEAD_GUIDANCE.failed} Tell them now, in your own words.`);
+        }
+      }).catch((err) => {
+        console.error('[soch] lead result handling failed', err);
+        if (this.sessionId === sessionId) this.leadInFlight = false;
+      });
+
+      return { status: 'submitting', booking_link_on_screen: true, guidance: internalNote(LEAD_SUBMITTING_GUIDANCE) };
     }
 
     _buildLeadPayload(trigger) {
@@ -1616,6 +1773,9 @@
       // Only an email the prospect confirmed is worth saving — never one that
       // was misheard and not yet read back.
       if (!this.sessionId || !this.emailConfirmed || !EMAIL_RE.test(ld.email || '')) return;
+      // A send_to_crm submission already on its way to n8n carries this data;
+      // a parallel partial save would race it on the same session row.
+      if (this.leadInFlight) return;
       const payload = this._buildLeadPayload('session_end');
       const sig = this._leadSignature(payload);
       if (sig === this.storedLeadSig) return;
