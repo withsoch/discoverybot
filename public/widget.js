@@ -141,23 +141,54 @@
     }
   }
 
-  // Discovery topics that must all be known (from what the prospect said)
-  // before the summary and score. Having values is necessary, not sufficient:
-  // the main problem must also have been explored and the summary confirmed.
+  // The minimum the prospect must have said before the score: what they do,
+  // their main problem, and one sense of how big it is. Everything else is
+  // optional and only feeds the score.
   const DISCOVERY_REQUIRED = [
     ['industry', 'what the company does'],
-    ['team_size', 'team size'],
-    ['main_processes', 'the main recurring work'],
-    ['tools_used', 'the tools and workflow involved'],
-    ['main_bottleneck', 'the main bottleneck'],
-    ['problem_frequency', 'how often or at what scale the problem happens'],
-    ['problem_impact', 'what the problem costs them'],
-    ['automation_dream', "what they'd most like automated"],
+    ['main_bottleneck', 'their main problem'],
   ];
-  // Fields that count as exploring the main problem once it has come up. Only
-  // detail about the problem itself: what they'd like automated, or a change
-  // to their general main work, is not depth on the problem.
-  const PAIN_DETAIL_FIELDS = ['main_bottleneck', 'problem_frequency', 'problem_impact'];
+  // Either field gives a scale signal (problem_frequency also holds time spent).
+  const SCALE_FIELDS = ['problem_frequency', 'problem_impact'];
+  const SCALE_LABEL = 'how often it happens, how much time it takes, or what it costs them';
+  const DISCOVERY_MAX_FOLLOWUPS = 2; // answers after the minimum is met before the model is told to score
+  const DISCOVERY_SOFT_MAX = 6;      // from this many answers, the model is told to wrap up
+
+  // Automation Readiness Score: the model classifies what the prospect said
+  // into these categories and the score is computed from them; the model never
+  // picks the number. Anything unknown or unrecognised scores 0.
+  const SCORE_RUBRIC = {
+    frequency:     { daily: 3, weekly: 2, monthly: 1, rare_or_unknown: 0 },
+    time_cost:     { over_15h_week: 3, '5_to_15h_week': 2, '2_to_5h_week': 1, under_2h_or_unknown: 0 },
+    impact:        { revenue_customers_cashflow: 3, errors_delays: 2, internal_annoyance: 1, none: 0 },
+    repeatability: { rule_based: 2, mixed: 1, human_judgement: 0 },
+    tools:         { several_digital_systems: 2, spreadsheets_email: 1, paper_none: 0 },
+    team_size:     { '11_plus': 2, '2_to_10': 1, solo: 0 },
+  };
+  const SCORE_MAX_POINTS = 15;
+  function scoreTier(score) {
+    return score >= 7.5 ? 'HIGH READINESS' : score >= 5 ? 'MEDIUM READINESS' : 'EARLY STAGE';
+  }
+  /** "12", "50-100", "about 20 people" → its band; null when no number was said. */
+  function teamSizeBand(teamSize) {
+    const m = String(teamSize || '').match(/\d+/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return n >= 11 ? '11_plus' : n >= 2 ? '2_to_10' : 'solo';
+  }
+  /** Points per category and the resulting score/tier. */
+  function computeScore(categories) {
+    const points = {};
+    let total = 0;
+    for (const [cat, values] of Object.entries(SCORE_RUBRIC)) {
+      const p = values[categories[cat]] || 0;
+      points[cat] = p;
+      total += p;
+    }
+    const score = Math.round((1 + 9 * total / SCORE_MAX_POINTS) * 10) / 10;
+    return { score, tier: scoreTier(score), total, points };
+  }
+
   // "unknown", "n/a", "not mentioned"…: a value the model filled in without the
   // prospect saying anything. It never counts as knowing a topic.
   const PLACEHOLDER_RE = /^(unspecified|unknown|unclear|undefined|null|none|nil|tbd|tba|pending|n\/?a|not (yet )?(mentioned|specified|provided|stated|given|known|discussed|shared|available|clear|sure|applicable)( yet)?|no (info|information|details?|data)( (yet|given|provided))?|-+|\?+)$/;
@@ -167,10 +198,6 @@
   function hasValue(v) {
     return v !== undefined && v !== null && String(v).trim() !== '' && !isPlaceholder(v);
   }
-  const SUMMARY_GAP = 'a confirmed summary of their main problem';
-  const DISCOVERY_MIN_ANSWERS = 5;    // safety floor, counting the answer to the summary
-  const DISCOVERY_MIN_PAIN_DETAIL = 2; // later answers that added detail about the main problem
-  const DISCOVERY_SOFT_MAX = 10;      // past this many answers, the model is asked to wrap up
 
   // "your team scores a 7 out of 10": a score said aloud (used to catch one
   // spoken without calling calculate_score).
@@ -178,12 +205,9 @@
 
   function newDiscoveryState() {
     return {
-      nudges: 0,                   // model turns the widget itself prompted (not prospect answers)
-      firstSeen: {},               // field -> answer index when it first got a value
-      painRaisedAt: null,          // answer index when the main bottleneck first came up
-      painDetailAnswers: new Set(), // later answer indexes that added detail about it
-      summaryAnswer: null,         // answer index when confirm_discovery_summary was accepted
-      summaryConfirmed: false,     // a prospect answer came after an accepted summary
+      nudges: 0,         // model turns the widget itself prompted (not prospect answers)
+      readyAt: null,     // answer index when the discovery minimum was first met
+      scoreForced: false, // the widget has told the model to score now (follow-up limit reached)
     };
   }
 
@@ -1048,7 +1072,7 @@
               this._setBarsMode(this.userSpeaking ? 'user' : 'idle');
             }
           },
-          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; this._checkSpokenScore(); },
+          onModelTurnEnd: () => { this.modelTurns++; this.lastTurnText = this.turnText; this.turnText = ''; if (!this._checkSpokenScore()) this._enforceFollowUpLimit(); },
           onInterrupted: () => { if (this.player) this.player.interrupt(); },
           onOpen: () => this.setStatus('Listening…'),
           onClose: () => {
@@ -1256,46 +1280,53 @@
             this.advancePhase(3);
             response = this._discoveryStatus();
             break;
-          case 'confirm_discovery_summary':
-            response = this._confirmSummary(a);
-            break;
           case 'calculate_score': {
-            // Scored once, only at the end of discovery: a call while required
-            // details are missing (or after the score is shown) is refused, so
-            // nothing is scored or revealed mid-conversation.
+            // Scored once, only once the discovery minimum is known: a call
+            // before that (or after the score is shown) is refused, so nothing
+            // is scored or revealed mid-conversation.
             if (this.leadData.score_out_of_10 != null) {
               response = { output: 'already_displayed', guidance: internalNote('The score was already calculated and shown. Do not calculate it again; carry on from where you are.') };
               break;
             }
-            const gaps = this._discoveryGaps({ needSummary: true });
-            if (gaps.length) {
-              const onlySummary = gaps.length === 1 && gaps[0] === SUMMARY_GAP;
+            const missing = this._missingDiscovery();
+            if (missing.length) {
               response = {
                 error: 'discovery_incomplete',
-                gaps,
-                guidance: internalNote(onlySummary
-                  ? "Nothing was scored or shown yet. First sum up their main problem in one or two sentences and check it with them, calling confirm_discovery_summary in the same turn; then wait for their answer. Don't mention a score."
-                  : this._gapGuidance(gaps, "Nothing was scored or shown: discovery isn't finished.")),
+                missing,
+                guidance: internalNote(`Nothing was scored or shown: still unclear: ${missing.join('; ')}. If the prospect already told you any of these, record it now with the matching capture tool, using what they said, then call calculate_score again. Otherwise ask about it naturally, around what they just said. Don't mention a score, an assessment or readiness.`),
               };
               break;
             }
             // The Live model sometimes calls this with no arguments; bounce it
             // back so it retries with values instead of the UI/CRM getting 0/10.
-            if (typeof a.score_out_of_10 !== 'number' || !a.tier || !a.opportunity_1) {
-              response = { error: 'Missing required fields. Call calculate_score again with score_out_of_10, tier, opportunity_1, opportunity_2, opportunity_3 and score_rationale filled in.' };
+            if (!a.opportunity_1) {
+              response = { error: 'Missing required fields. Call calculate_score again with every category plus opportunity_1, opportunity_2, opportunity_3 and score_rationale filled in.' };
               break;
             }
+            // The score comes from the rubric, never from the model. A team
+            // size the prospect said as a number beats the model's category.
+            const categories = {};
+            for (const cat of Object.keys(SCORE_RUBRIC)) categories[cat] = a[cat];
+            categories.team_size = teamSizeBand(this.leadData.team_size) || a.team_size;
+            const result = computeScore(categories);
             Object.assign(this.leadData, {
-              score_out_of_10: a.score_out_of_10,
-              tier: a.tier,
+              score_out_of_10: result.score,
+              tier: result.tier,
               opportunities: [a.opportunity_1, a.opportunity_2, a.opportunity_3].filter(Boolean),
               score_rationale: a.score_rationale,
+              score_inputs: { categories, points: result.points, total: result.total },
             });
-            this.showScore(a);
+            this.showScore({ ...a, score_out_of_10: result.score, tier: result.tier });
             this.advancePhase(4);
-            response = this.scoreNudged
-              ? { output: 'displayed', guidance: internalNote("It's now on screen. You already told them the score, so don't repeat it; carry on from where you were.") }
-              : { output: 'displayed' };
+            const spoken = `${result.score} out of 10, ${result.tier}`;
+            response = {
+              output: 'displayed',
+              score_out_of_10: result.score,
+              tier: result.tier,
+              guidance: internalNote(this.scoreNudged
+                ? `It's now on screen as ${spoken}. If that isn't what you told them, correct it briefly and naturally; otherwise don't repeat it. Carry on from where you were.`
+                : `The score on screen is ${spoken}. Deliver exactly that score and tier.`),
+            };
             break;
           }
           case 'capture_lead':
@@ -1335,18 +1366,40 @@
     /**
      * Safety net: if the model said a score out loud without calling
      * calculate_score, nothing reached the screen or the CRM. Ask it once to
-     * record that same score now (the discovery guard still applies).
+     * record it now (the discovery guard still applies, and the rubric sets the number).
      */
     _checkSpokenScore() {
-      if (this.scoreNudged || this.leadData.score_out_of_10 != null || !this.client) return;
-      if (!SPOKEN_SCORE_RE.test(this.lastTurnText)) return;
+      if (this.scoreNudged || this.leadData.score_out_of_10 != null || !this.client) return false;
+      if (!SPOKEN_SCORE_RE.test(this.lastTurnText)) return false;
       this.scoreNudged = true;
       this.discovery.nudges++;
-      this.client.sendText(internalNote("You just told the prospect a score, but calculate_score was never called, so nothing is shown on their screen or saved. Call calculate_score now with exactly the score, tier and opportunities you said. Don't say anything to the prospect about this."));
+      this.client.sendText(internalNote("You just told the prospect a score, but calculate_score was never called, so nothing is shown on their screen or saved. Call calculate_score now with the categories and the opportunities you said; it works out the score. Don't say anything to the prospect about this."));
+      return true;
     }
 
+    /**
+     * Code-enforced follow-up limit, checked at the end of every model turn so
+     * it never depends on a capture tool firing. Once the discovery minimum is
+     * met the model gets DISCOVERY_MAX_FOLLOWUPS more answers (fewer at the
+     * soft max); a turn ending after that without a score gets one explicit
+     * instruction to score now instead of waiting on another question.
+     */
+    _enforceFollowUpLimit() {
+      const d = this.discovery;
+      if (d.scoreForced || d.readyAt == null || this.leadData.score_out_of_10 != null || !this.client) return;
+      if (this.leadData.email) return; // name/email flow under way or done: don't cut into it
+      const answered = this._answerIndex() - 1; // the answer the model just responded to
+      if (answered - d.readyAt < DISCOVERY_MAX_FOLLOWUPS && answered < DISCOVERY_SOFT_MAX) return;
+      d.scoreForced = true;
+      d.nudges++;
+      this.client.sendText(internalNote("That's enough follow-ups. Don't ask another discovery question, and don't wait for an answer to one you just asked. Call calculate_score now, before you say anything, then deliver the score. If you're in the middle of taking their name and email, finish that first and call calculate_score right after."));
+    }
+
+    /** What the discovery minimum still lacks: what they do, their main problem, and one scale signal. */
     _missingDiscovery() {
-      return DISCOVERY_REQUIRED.filter(([k]) => !hasValue(this.leadData[k])).map(([, label]) => label);
+      const missing = DISCOVERY_REQUIRED.filter(([k]) => !hasValue(this.leadData[k])).map(([, label]) => label);
+      if (!SCALE_FIELDS.some((k) => hasValue(this.leadData[k]))) missing.push(SCALE_LABEL);
+      return missing;
     }
 
     /** Index of the prospect answer the model is responding to (1 = first answer after the opener). */
@@ -1355,127 +1408,56 @@
     }
 
     /**
-     * Records capture-tool details and how the conversation got there: when
-     * each field first appeared, when the main problem came up, and which
-     * later answers added detail about it (the depth signal).
+     * Records capture-tool details and notes when the discovery minimum was
+     * first met. Placeholders are dropped, so they never count as known or
+     * overwrite what the prospect said.
      */
     _recordDiscovery(fields) {
-      const d = this.discovery;
-      const idx = this._answerIndex();
       const real = {};
       for (const [k, v] of Object.entries(fields)) {
-        if (!hasValue(v)) continue;
-        real[k] = v;
-        const changed = String(this.leadData[k] || '') !== String(v);
-        if (d.firstSeen[k] == null) d.firstSeen[k] = idx;
-        if (k === 'main_bottleneck' && d.painRaisedAt == null) d.painRaisedAt = idx;
-        else if (changed && d.painRaisedAt != null && idx > d.painRaisedAt && PAIN_DETAIL_FIELDS.includes(k)) {
-          d.painDetailAnswers.add(idx);
-        }
+        if (hasValue(v)) real[k] = v;
       }
-      // Placeholders are dropped, so they never overwrite what the prospect said.
       mergeDefined(this.leadData, real);
+      if (this.discovery.readyAt == null && !this._missingDiscovery().length) {
+        this.discovery.readyAt = this._answerIndex();
+      }
     }
 
-    /**
-     * True once a prospect answer has come after an accepted summary. Counted
-     * in prospect answers, so a turn the widget prompted never confirms it; and
-     * once confirmed it stays confirmed, so a re-summary can't loop the score.
-     */
-    _summaryConfirmed() {
+    /** Time to score: the follow-ups after the minimum are used up, or the conversation reached the soft max. */
+    _shouldWrapUp() {
       const d = this.discovery;
-      if (!d.summaryConfirmed && d.summaryAnswer != null && this._answerIndex() > d.summaryAnswer) {
-        d.summaryConfirmed = true;
-      }
-      return d.summaryConfirmed;
+      const idx = this._answerIndex();
+      return idx >= DISCOVERY_SOFT_MAX || (d.readyAt != null && idx - d.readyAt >= DISCOVERY_MAX_FOLLOWUPS);
     }
 
     /**
-     * What still stands between the conversation and a score. Empty means
-     * discovery is genuinely complete: every topic known, the main problem
-     * explored in later answers, enough answers overall, summary confirmed.
-     */
-    _discoveryGaps({ needSummary }) {
-      const d = this.discovery;
-      const gaps = this._missingDiscovery();
-      if (d.painDetailAnswers.size < DISCOVERY_MIN_PAIN_DETAIL) {
-        gaps.push('the main problem itself — explore how it works, how often, who does it and what it costs before wrapping up');
-      }
-      const minAnswers = needSummary ? DISCOVERY_MIN_ANSWERS : DISCOVERY_MIN_ANSWERS - 1;
-      if (this._answerIndex() < minAnswers) gaps.push('the conversation is still short — keep exploring what they tell you');
-      if (needSummary && !this._summaryConfirmed()) gaps.push(SUMMARY_GAP);
-      return gaps;
-    }
-
-    /**
-     * Guidance for a refused summary/score: topics never recorded (record them
-     * if the prospect already said them) are kept apart from depth gaps (keep
-     * exploring), and the model is told not to hint at scoring.
-     */
-    _gapGuidance(gaps, lead) {
-      const missing = this._missingDiscovery();
-      const depth = gaps.filter((g) => !missing.includes(g) && g !== SUMMARY_GAP);
-      const parts = [lead];
-      if (missing.length) parts.push(`Not recorded yet: ${missing.join(', ')}. If the prospect already told you any of these, record it now with the matching capture tool, using what they said.`);
-      if (depth.length) parts.push(`Also not clear yet: ${depth.join('; ')}.`);
-      parts.push("Keep the conversation going around what they just said; don't ask about a topic just because it's on this list. Don't mention a score, an assessment or readiness.");
-      return internalNote(parts.join(' '));
-    }
-
-    /** confirm_discovery_summary: accepted only once the picture is clear; the score then waits for their answer. */
-    _confirmSummary(a) {
-      if (this.leadData.score_out_of_10 != null) {
-        return { output: 'already_scored', guidance: internalNote('The score is already on screen. Carry on from where you are.') };
-      }
-      const gaps = this._discoveryGaps({ needSummary: false });
-      if (gaps.length) {
-        return {
-          error: 'not_ready',
-          gaps,
-          guidance: this._gapGuidance(gaps, "That summary doesn't count yet: the picture isn't clear enough. After they answer, sum up again later."),
-        };
-      }
-      const alreadyConfirmed = this._summaryConfirmed();
-      this.discovery.summaryAnswer = this._answerIndex();
-      this.leadData.discovery_summary = String(a.summary || '').slice(0, 600);
-      if (alreadyConfirmed) {
-        return {
-          output: 'summary_recorded',
-          guidance: internalNote("They already confirmed your summary. If what they just said doesn't change the picture, your next action is to call calculate_score, before you say anything."),
-        };
-      }
-      return {
-        output: 'summary_recorded',
-        guidance: internalNote("Wait for their answer. If they confirm, your next action is to call calculate_score, before you say anything. If they add something important, explore it briefly, then sum up again with confirm_discovery_summary."),
-      };
-    }
-
-    /**
-     * Reply to the capture_* tools. It never pushes toward the score: once the
-     * picture is clear it only invites a summary at a natural end; it also
-     * stops the model re-speaking what it said before the tool call.
+     * Reply to the capture_* tools. Once the minimum is known it points the
+     * model at the score (one follow-up at most, only if genuinely needed);
+     * it also stops the model re-speaking what it said before the tool call.
      */
     _discoveryStatus() {
       const noRepeat = "Recorded silently. Don't comment on it, and don't repeat anything you already said this turn; if you've already asked your question, stop and wait for their answer.";
       if (this.leadData.score_out_of_10 != null) {
         return { output: 'captured', guidance: internalNote(noRepeat) };
       }
-      const gaps = this._discoveryGaps({ needSummary: false });
-      if (!gaps.length) {
+      const missing = this._missingDiscovery();
+      if (!missing.length) {
         return {
           output: 'captured',
-          guidance: internalNote(`${noRepeat} You have a good picture now. When the conversation reaches a natural end, sum up their main problem and check it with them, calling confirm_discovery_summary in the same turn.`),
+          guidance: internalNote(this._shouldWrapUp()
+            ? "Recorded silently. Don't comment on it or repeat anything you already said this turn. You have enough. Don't ask another question: your next action is to call calculate_score, before you say anything about a score."
+            : `${noRepeat} You have enough to score. Only if something important about their main problem is genuinely unclear, ask one short follow-up about it. Otherwise your next action is to call calculate_score, before you say anything about a score. Never ask a question just to fill in a detail.`),
         };
       }
       if (this._answerIndex() >= DISCOVERY_SOFT_MAX) {
         return {
           output: 'captured',
-          guidance: internalNote(`${noRepeat} The conversation has gone on a while: start wrapping up. If something essential is still unclear (${gaps.join('; ')}), ask about it directly, then sum up their main problem. Don't mention a score yet.`),
+          guidance: internalNote(`${noRepeat} The conversation has gone on a while: wrap up. Ask directly about what's still unclear (${missing.join('; ')}), then score. Don't mention a score yet.`),
         };
       }
       return {
         output: 'captured',
-        guidance: internalNote(`${noRepeat} Discovery isn't finished, so don't mention any score. Keep the conversation going around what they just said.`),
+        guidance: internalNote(`${noRepeat} Not enough for the score yet (still unclear: ${missing.join('; ')}), so don't mention any score. Keep the conversation going around what they just said.`),
       };
     }
 
