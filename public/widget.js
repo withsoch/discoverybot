@@ -206,9 +206,23 @@
     return v !== undefined && v !== null && String(v).trim() !== '' && !isPlaceholder(v);
   }
 
-  // "your team scores a 7 out of 10": a score said aloud (used to catch one
-  // spoken without calling calculate_score).
-  const SPOKEN_SCORE_RE = /\bscor(e|es|ed|ing)\b[^.?!]{0,40}?\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s*(out of|\/)\s*(10|ten)\b/i;
+  // "your team scores a 6.4 out of 10" / "six point four out of ten": a score
+  // said aloud (shown straight away, and used to catch one spoken without
+  // calling calculate_score). Group 2 is the number.
+  const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+  const SPOKEN_SCORE_RE = new RegExp(
+    String.raw`\bscor(e|es|ed|ing)\b(?:[^.?!]|\.(?=\d)){0,40}?\b(\d{1,2}(?:\.\d+)?|(?:${NUMBER_WORDS.join('|')})(?:\s+point\s+(?:${NUMBER_WORDS.slice(0, 10).join('|')}))?)\s*(out of|\/)\s*(10|ten)\b`,
+    'i'
+  );
+  /** "6.4", "six point four" → 6.4; NaN when it isn't a number. */
+  function spokenNumber(text) {
+    const t = String(text).toLowerCase().trim();
+    if (/^\d/.test(t)) return Number(t);
+    const [whole, frac] = t.split(/\s+point\s+/);
+    const w = NUMBER_WORDS.indexOf(whole);
+    const f = frac == null ? 0 : NUMBER_WORDS.indexOf(frac);
+    return w < 0 || f < 0 ? NaN : w + f / 10;
+  }
 
   function newDiscoveryState() {
     return {
@@ -819,6 +833,8 @@
       // ended at least one turn (read the email back) since capture_lead.
       this.modelTurns = 0;
       this.scoreNudged = false;    // asked the model once to record a score it only spoke
+      this.spokenScoreShown = false; // a score the model spoke is on screen before calculate_score
+      this.shownScore = 0;         // the number the ring currently shows
       this.discovery = newDiscoveryState();
       this.turnText = '';          // what the bot has said in the current turn
       this.lastTurnText = '';      // …and in the previous one
@@ -1084,7 +1100,8 @@
     }
 
     // ───── Score reveal ─────
-    showScore(data) {
+    /** `provisional`: a score the model only spoke, shown until calculate_score replaces it. */
+    showScore(data, { provisional = false } = {}) {
       this.els.cta.hidden = false;
       const score = Number(data.score_out_of_10) || 0;
       const pct = Math.max(0, Math.min(1, score / 10));
@@ -1093,12 +1110,16 @@
       void this.els.ringFg.offsetWidth;
       this.els.ringFg.style.strokeDashoffset = String(offset);
 
+      // Count from whatever is showing, so a correction doesn't restart at 0.
+      const from = this.shownScore;
+      this.shownScore = score;
       const start = performance.now();
       const duration = 1500;
       const tick = (now) => {
+        if (this.shownScore !== score) return; // superseded by a newer score
         const t = Math.min(1, (now - start) / duration);
         const eased = 1 - Math.pow(1 - t, 3);
-        this.els.scoreNum.textContent = (score * eased).toFixed(1);
+        this.els.scoreNum.textContent = (from + (score - from) * eased).toFixed(1);
         if (t < 1) requestAnimationFrame(tick);
         else this.els.scoreNum.textContent = score.toFixed(1);
       };
@@ -1112,7 +1133,24 @@
         li.textContent = o;
         this.els.opps.appendChild(li);
       }
-      this._emit('score', { score, tier: data.tier, opportunities: opps });
+      if (!provisional) this._emit('score', { score, tier: data.tier, opportunities: opps });
+    }
+
+    /**
+     * Puts a score on screen the moment the model says it, without waiting
+     * for calculate_score: the model sometimes speaks first, or never calls
+     * it. _checkSpokenScore then gets it recorded, and the rubric score
+     * replaces this one when it arrives.
+     */
+    _showSpokenScore() {
+      if (this.spokenScoreShown || this.leadData.score_out_of_10 != null) return;
+      const m = SPOKEN_SCORE_RE.exec(this.turnText);
+      if (!m) return;
+      const score = spokenNumber(m[2]);
+      if (!(score >= 0 && score <= 10)) return;
+      this.spokenScoreShown = true;
+      this.showScore({ score_out_of_10: score, tier: scoreTier(score) }, { provisional: true });
+      this.advancePhase(4);
     }
 
     // ───── Session lifecycle ─────
@@ -1155,6 +1193,7 @@
             this.modelTurnOpen = true;
             this.turnText += t;
             this.appendModelTranscript(t, fin);
+            this._showSpokenScore();
             if (EMAIL_ASK_RE.test(this.turnText)) this._showEmailInput();
           },
           onToolCalls: (calls) => { this.modelTurnOpen = true; this._handleToolCalls(calls); },
@@ -1321,6 +1360,8 @@
       this.turnText = '';
       this.lastTurnText = '';
       this.scoreNudged = false;
+      this.spokenScoreShown = false;
+      this.shownScore = 0;
       this.discovery = newDiscoveryState();
       this._renderBooking();
       this.phaseIndex = -1;
@@ -1329,6 +1370,8 @@
       this.els.cta.hidden = true;
       this.els.ringFg.style.strokeDashoffset = String(RING_CIRCUMFERENCE);
       this.els.scoreNum.textContent = '0.0';
+      this.els.tier.textContent = '';
+      this.els.opps.innerHTML = '';
       this.muted = false;
       this.els.mic.classList.remove('muted');
       this.els.mic.title = 'Mute';
