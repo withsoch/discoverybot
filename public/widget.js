@@ -72,6 +72,9 @@
   const LEAD_SUBMITTING_GUIDANCE = "Their details are being sent right now and nothing is confirmed yet. Say only a short \"One moment while I send that over\", then stop and wait. Do NOT say you've emailed them, that Riz has their details, or that anything is booked. The real result will reach you in a moment as an internal note; don't call send_to_crm again.";
   // An internal note waits for the model to finish its turn, but never longer than this.
   const NOTE_MAX_WAIT_MS = 8000;
+  // A calculated score is shown when the bot says it; this long after the
+  // tool returned, it's shown anyway.
+  const SCORE_REVEAL_FALLBACK_MS = 12000;
   // The bot asking for an email ("What's your name and email…?").
   const EMAIL_ASK_RE = /\b(your|and)\s+e-?mail\b|\be-?mail\b[^.!]*\?/i;
   // Matching on-screen note under the Book-a-Call button.
@@ -206,19 +209,24 @@
     return v !== undefined && v !== null && String(v).trim() !== '' && !isPlaceholder(v);
   }
 
-  // "your team scores a 6.4 out of 10" / "six point four out of ten": a score
-  // said aloud (shown straight away, and used to catch one spoken without
-  // calling calculate_score). Group 2 is the number.
+  // A score said aloud, however it's phrased: "your score is 6.4", "your team
+  // scores a six point four out of ten", "your readiness comes out at 7/10".
+  // Times, counts and percentages ("10 hours", "3 tools") don't count, and a
+  // number must be followed by something so a half-streamed "6" of "6.4"
+  // isn't read as 6. Group 1 is the number.
   const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+  const SPOKEN_NUMBER = String.raw`\d{1,2}(?:\s?[.,]\s?\d)?|(?:${NUMBER_WORDS.join('|')})(?:[\s-]+point[\s-]+(?:${NUMBER_WORDS.slice(0, 10).join('|')}))?`;
   const SPOKEN_SCORE_RE = new RegExp(
-    String.raw`\bscor(e|es|ed|ing)\b(?:[^.?!]|\.(?=\d)){0,40}?\b(\d{1,2}(?:\.\d+)?|(?:${NUMBER_WORDS.join('|')})(?:\s+point\s+(?:${NUMBER_WORDS.slice(0, 10).join('|')}))?)\s*(out of|\/)\s*(10|ten)\b`,
+    String.raw`\b(?:scor(?:e|es|ed|ing)|readiness|rating|rated?)\b[^?!]{0,60}?(?<!out of\s*)\b(${SPOKEN_NUMBER})\b` +
+    String.raw`(?!\s*(?:%|percent|per\b|hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?|people|staff|employees|tools?|times?|x\b|[.,]\d))` +
+    String.raw`(?=\s*(?:[^\s\d.,]|[.,](?!\d)))`,
     'i'
   );
-  /** "6.4", "six point four" → 6.4; NaN when it isn't a number. */
+  /** "6.4", "6 . 4", "six point four" → 6.4; NaN when it isn't a number. */
   function spokenNumber(text) {
     const t = String(text).toLowerCase().trim();
-    if (/^\d/.test(t)) return Number(t);
-    const [whole, frac] = t.split(/\s+point\s+/);
+    if (/^\d/.test(t)) return Number(t.replace(/\s/g, '').replace(',', '.'));
+    const [whole, frac] = t.split(/[\s-]+point[\s-]+/);
     const w = NUMBER_WORDS.indexOf(whole);
     const f = frac == null ? 0 : NUMBER_WORDS.indexOf(frac);
     return w < 0 || f < 0 ? NaN : w + f / 10;
@@ -468,6 +476,12 @@
           this.onStateChange(false);
         }
       };
+    }
+
+    /** Seconds until the audio queued so far has finished playing. */
+    queuedSeconds() {
+      if (!this.audioContext) return 0;
+      return Math.max(0, this.nextStartTime - this.audioContext.currentTime);
     }
 
     interrupt() {
@@ -835,6 +849,10 @@
       this.scoreNudged = false;    // asked the model once to record a score it only spoke
       this.spokenScoreShown = false; // a score the model spoke is on screen before calculate_score
       this.shownScore = 0;         // the number the ring currently shows
+      // calculate_score's result waits here until the bot says the score out loud.
+      this.pendingScore = null;
+      this.scoreRevealTimer = null;
+      this.emailAfterScore = false; // the email box was asked for before the score was on screen
       this.discovery = newDiscoveryState();
       this.turnText = '';          // what the bot has said in the current turn
       this.lastTurnText = '';      // …and in the previous one
@@ -913,6 +931,11 @@
     /** Shows the typed-email fallback unless the lead has already been stored. */
     _showEmailInput() {
       if (!this.sessionActive || this.lastLeadResult || !this.els.emailForm.hidden) return;
+      // The score is about to appear: the email box comes after it, not before.
+      if (this.pendingScore || (this.spokenScoreShown && this.els.cta.hidden)) {
+        this.emailAfterScore = true;
+        return;
+      }
       this.els.emailForm.hidden = false;
     }
 
@@ -1137,20 +1160,59 @@
     }
 
     /**
-     * Puts a score on screen the moment the model says it, without waiting
-     * for calculate_score: the model sometimes speaks first, or never calls
-     * it. _checkSpokenScore then gets it recorded, and the rubric score
-     * replaces this one when it arrives.
+     * Called as the bot's words stream in. When it says the score ("based on
+     * what you've shared, your score is 6.4…"), the score appears as that
+     * sentence plays: the calculated one if calculate_score already ran, or
+     * the spoken number if the model said it without calling the tool
+     * (_checkSpokenScore then gets it recorded, and the rubric score replaces it).
      */
-    _showSpokenScore() {
-      if (this.spokenScoreShown || this.leadData.score_out_of_10 != null) return;
+    _onScoreSpeech() {
+      if (this.spokenScoreShown || this.els.cta.hidden === false) return;
       const m = SPOKEN_SCORE_RE.exec(this.turnText);
       if (!m) return;
-      const score = spokenNumber(m[2]);
+      // The words arrive ahead of the audio: wait for what's already queued to play.
+      const delay = this.player ? this.player.queuedSeconds() * 1000 : 0;
+      if (this.pendingScore) {
+        // Schedule once: later chunks queue more audio and would push it back.
+        if (!this.pendingScore.heard) {
+          this.pendingScore.heard = true;
+          this._scheduleScoreReveal(delay);
+        }
+        return;
+      }
+      if (this.leadData.score_out_of_10 != null) return;
+      const score = spokenNumber(m[1]);
       if (!(score >= 0 && score <= 10)) return;
       this.spokenScoreShown = true;
-      this.showScore({ score_out_of_10: score, tier: scoreTier(score) }, { provisional: true });
+      setTimeout(() => {
+        if (!this.spokenScoreShown || this.leadData.score_out_of_10 != null) return; // restarted or replaced
+        this.showScore({ score_out_of_10: score, tier: scoreTier(score) }, { provisional: true });
+        this._afterScoreShown();
+      }, delay);
+    }
+
+    _scheduleScoreReveal(delayMs) {
+      clearTimeout(this.scoreRevealTimer);
+      this.scoreRevealTimer = setTimeout(() => this._revealScore(), delayMs);
+    }
+
+    /** Shows the calculated score waiting in pendingScore. */
+    _revealScore() {
+      clearTimeout(this.scoreRevealTimer);
+      this.scoreRevealTimer = null;
+      const data = this.pendingScore;
+      if (!data) return;
+      this.pendingScore = null;
+      this.showScore(data);
+      this._afterScoreShown();
+    }
+
+    _afterScoreShown() {
       this.advancePhase(4);
+      if (this.emailAfterScore) {
+        this.emailAfterScore = false;
+        this._showEmailInput();
+      }
     }
 
     // ───── Session lifecycle ─────
@@ -1193,7 +1255,7 @@
             this.modelTurnOpen = true;
             this.turnText += t;
             this.appendModelTranscript(t, fin);
-            this._showSpokenScore();
+            this._onScoreSpeech();
             if (EMAIL_ASK_RE.test(this.turnText)) this._showEmailInput();
           },
           onToolCalls: (calls) => { this.modelTurnOpen = true; this._handleToolCalls(calls); },
@@ -1342,6 +1404,7 @@
       this.pendingNotes = [];
       this.modelTurnOpen = false;
       this.cancelledToolIds.clear();
+      this._revealScore(); // the call ended before the bot said a calculated score: show it now
       this._hideEmailInput();
       this.cleaningUp = false;
     }
@@ -1362,6 +1425,10 @@
       this.scoreNudged = false;
       this.spokenScoreShown = false;
       this.shownScore = 0;
+      clearTimeout(this.scoreRevealTimer);
+      this.scoreRevealTimer = null;
+      this.pendingScore = null;
+      this.emailAfterScore = false;
       this.discovery = newDiscoveryState();
       this._renderBooking();
       this.phaseIndex = -1;
@@ -1461,6 +1528,15 @@
               };
               break;
             }
+            // The answer that completed the minimum (usually the hours a week)
+            // gets a conversational follow-up first, never the score straight away.
+            if (this._needsFollowUp()) {
+              response = {
+                error: 'too_soon',
+                guidance: internalNote("Nothing was scored or shown. They just told you how big the problem is, so don't score yet: react to that answer naturally in your own words, then ask one short follow-up that builds on it (what it's costing them, who's stuck doing it, or what they'd love to stop doing by hand), and wait for their answer. Don't mention a score, an assessment or readiness."),
+              };
+              break;
+            }
             // The Live model sometimes calls this with no arguments; bounce it
             // back so it retries with values instead of the UI/CRM getting 0/10.
             if (!a.opportunity_1) {
@@ -1480,9 +1556,15 @@
               score_rationale: a.score_rationale,
               score_inputs: { categories, points: result.points, total: result.total },
             });
-            this.showScore({ ...a, score_out_of_10: result.score, tier: result.tier });
-            this.advancePhase(4);
-            this._showEmailInput(); // the score delivery ends by asking for name and email
+            this.pendingScore = { ...a, score_out_of_10: result.score, tier: result.tier };
+            if (this.spokenScoreShown) {
+              // The bot already said a score: correct the screen straight away.
+              this._revealScore();
+            } else {
+              // Revealed when the bot says the score (_onScoreSpeech); this is
+              // the fallback in case it phrases it in a way we don't recognise.
+              this._scheduleScoreReveal(SCORE_REVEAL_FALLBACK_MS);
+            }
             const spoken = `${result.score} out of 10, ${result.tier}`;
             response = {
               output: 'displayed',
@@ -1589,6 +1671,16 @@
       }
     }
 
+    /**
+     * True while the model is still on the answer that completed the minimum:
+     * at least one follow-up must be answered before scoring (waived at the soft max).
+     */
+    _needsFollowUp() {
+      const d = this.discovery;
+      const idx = this._answerIndex();
+      return d.readyAt != null && idx <= d.readyAt && idx < DISCOVERY_SOFT_MAX;
+    }
+
     /** Time to score: the follow-ups after the minimum are used up, or the conversation reached the soft max. */
     _shouldWrapUp() {
       const d = this.discovery;
@@ -1607,6 +1699,12 @@
         return { output: 'captured', guidance: internalNote(noRepeat) };
       }
       const missing = this._missingDiscovery();
+      if (!missing.length && this._needsFollowUp()) {
+        return {
+          output: 'captured',
+          guidance: internalNote(`${noRepeat} Don't score yet and don't mention a score. If you haven't already, react to what they just told you in your own words, then ask one short follow-up that builds on it (what it's costing them, who's stuck doing it, or what they'd love to stop doing by hand), and wait for their answer.`),
+        };
+      }
       if (!missing.length) {
         return {
           output: 'captured',
